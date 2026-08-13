@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Agar.io Clone</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #111; font-family: sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+
+    #overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 10;
+    }
+    .panel {
+      background: #222; padding: 30px; border-radius: 12px; text-align: center; color: white; width: 300px;
+    }
+    .panel input {
+      width: 100%; padding: 12px; margin: 15px 0; border: none; border-radius: 6px; font-size: 16px; text-align: center;
+    }
+    .panel button {
+      width: 100%; padding: 12px; background: #3b82f6; border: none; color: white;
+      font-size: 18px; font-weight: bold; border-radius: 6px; cursor: pointer;
+    }
+
+    .touch-btn {
+      position: absolute; bottom: 30px; width: 65px; height: 65px; background: rgba(255,255,255,0.25);
+      border: 2px solid rgba(255,255,255,0.5); border-radius: 50%; color: white; font-weight: bold;
+      display: flex; align-items: center; justify-content: center; font-size: 14px; z-index: 5;
+    }
+    #btn-split { right: 30px; }
+    #btn-eject { right: 110px; }
+  </style>
+</head>
+<body>
+
+  <div id="overlay">
+    <div class="panel">
+      <h2>Agar.io Clone</h2>
+      <input type="text" id="nickname" placeholder="Enter Nickname" maxlength="12">
+      <button id="start-btn">Play</button>
+    </div>
+  </div>
+
+  <div id="btn-split" class="touch-btn">SPLIT</div>
+  <div id="btn-eject" class="touch-btn">EJECT</div>
+
+  <canvas id="gameCanvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    let ws = null;
+    let myPlayerId = null;
+    let worldSize = 8000;
+    let isDead = true;
+    let isRespawning = false;
+    let zoomMultiplier = 1;
+    
+    let clientEntitiesMap = new Map();
+    let clientPlayersMap = new Map();
+    let localCells = []; 
+    let leaderboardData = [];
+
+    let mouseX = window.innerWidth / 2;
+    let mouseY = window.innerHeight / 2;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    let touchJoystick = null;
+    let lastTargetSend = 0;
+
+    const getRadius = (mass) => Math.sqrt(mass) * 6;
+
+    const camera = {
+      x: worldSize / 2,
+      y: worldSize / 2,
+      scale: 1,
+      targetX: worldSize / 2,
+      targetY: worldSize / 2,
+      targetScale: 1
+    };
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    window.addEventListener('wheel', (e) => {
+      if (isDead) return;
+      zoomMultiplier *= Math.pow(0.9, e.deltaY / -120);
+      zoomMultiplier = Math.max(0.2, Math.min(2.5, zoomMultiplier));
+    });
+
+    document.getElementById('start-btn').onclick = () => {
+      const name = document.getElementById('nickname').value;
+      document.getElementById('overlay').style.display = 'none';
+      isDead = false;
+      isRespawning = true;
+      zoomMultiplier = 1;
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${location.host}`);
+
+        ws.onclose = () => { isDead = true; isRespawning = false; localCells = []; document.getElementById('overlay').style.display = 'flex'; };
+        ws.onerror = () => { isDead = true; isRespawning = false; localCells = []; document.getElementById('overlay').style.display = 'flex'; };
+
+        ws.onmessage = (evt) => {
+          const msg = JSON.parse(evt.data);
+
+          if (msg.type === 'init') {
+            myPlayerId = msg.playerId;
+            worldSize = msg.worldSize;
+            ws.send(JSON.stringify({ type: 'join', name }));
+          } else if (msg.type === 'state') {
+            leaderboardData = msg.leaderboard || [];
+
+            const currentEntityIds = new Set();
+            msg.entities.forEach(sEnt => {
+              currentEntityIds.add(sEnt.id);
+              let cEnt = clientEntitiesMap.get(sEnt.id);
+              if (!cEnt) {
+                clientEntitiesMap.set(sEnt.id, {
+                  ...sEnt,
+                  targetX: sEnt.x,
+                  targetY: sEnt.y,
+                  targetMass: sEnt.mass,
+                  eatenLocally: false
+                });
+              } else {
+                cEnt.type = sEnt.type;
+                cEnt.color = sEnt.color;
+                cEnt.isSpiky = sEnt.isSpiky;
+                cEnt.mass = sEnt.mass;
+                cEnt.targetX = sEnt.x;
+                cEnt.targetY = sEnt.y;
+                cEnt.targetMass = sEnt.mass;
+                cEnt.radius = getRadius(cEnt.mass);
+              }
+            });
+            for (let [id] of clientEntitiesMap) {
+              if (!currentEntityIds.has(id)) clientEntitiesMap.delete(id);
+            }
+
+            const activePlayerIds = new Set(msg.players.map(p => p.id));
+            for (let [pId] of clientPlayersMap) {
+              if (!activePlayerIds.has(pId)) clientPlayersMap.delete(pId);
+            }
+
+            msg.players.forEach(sPlayer => {
+              let pObj = clientPlayersMap.get(sPlayer.id);
+              if (!pObj) {
+                pObj = { id: sPlayer.id, name: sPlayer.name, color: sPlayer.color, cells: new Map() };
+                clientPlayersMap.set(sPlayer.id, pObj);
+              }
+              pObj.name = sPlayer.name;
+              pObj.color = sPlayer.color;
+
+              const currentCellIds = new Set();
+              sPlayer.cells.forEach(sCell => {
+                currentCellIds.add(sCell.id);
+                let cCell = pObj.cells.get(sCell.id);
+                if (!cCell) {
+                  pObj.cells.set(sCell.id, {
+                    ...sCell,
+                    targetX: sCell.x,
+                    targetY: sCell.y,
+                    targetMass: sCell.mass,
+                    radius: getRadius(sCell.mass)
+                  });
+                } else {
+                  cCell.targetX = sCell.x;
+                  cCell.targetY = sCell.y;
+                  cCell.targetMass = sCell.mass;
+                  cCell.radius = getRadius(cCell.mass);
+                  cCell.vx = sCell.vx;
+                  cCell.vy = sCell.vy;
+                  cCell.canMergeAfter = sCell.canMergeAfter;
+                }
+              });
+              for (let [cId] of pObj.cells) {
+                if (!currentCellIds.has(cId)) pObj.cells.delete(cId);
+              }
+            });
+
+            const me = msg.players.find(p => p.id === myPlayerId);
+            if (me) {
+              if (me.cells.length > 0) {
+                isRespawning = false;
+                isDead = false;
+                if (localCells.length === 0) {
+                  localCells = me.cells.map(c => ({ 
+                    ...c, 
+                    targetX: c.x, 
+                    targetY: c.y, 
+                    targetMass: c.mass, 
+                    radius: getRadius(c.mass) 
+                  }));
+                } else {
+                  me.cells.forEach(sCell => {
+                    const lCell = localCells.find(c => c.id === sCell.id);
+                    if (lCell) {
+                      lCell.targetX = sCell.x;
+                      lCell.targetY = sCell.y;
+                      lCell.targetMass = sCell.mass;
+                      lCell.radius = getRadius(lCell.mass);
+                      lCell.vx = sCell.vx;
+                      lCell.vy = sCell.vy;
+                      lCell.canMergeAfter = sCell.canMergeAfter;
+                    } else {
+                      localCells.push({ 
+                        ...sCell, 
+                        targetX: sCell.x, 
+                        targetY: sCell.y, 
+                        targetMass: sCell.mass, 
+                        radius: getRadius(sCell.mass) 
+                      });
+                    }
+                  });
+                  localCells = localCells.filter(c => me.cells.some(sCell => sCell.id === c.id));
+                }
+              } else if (me.cells.length === 0 && !isDead && !isRespawning) {
+                isDead = true;
+                localCells = [];
+                document.getElementById('overlay').style.display = 'flex';
+              }
+            } else if (myPlayerId && !isDead && !isRespawning) {
+              isDead = true;
+              localCells = [];
+              document.getElementById('overlay').style.display = 'flex';
+            }
+          }
+        };
+      } else {
+        ws.send(JSON.stringify({ type: 'join', name }));
+      }
+    };
+
+    window.addEventListener('mousemove', (e) => {
+      if (touchJoystick) return;
+      mouseX = e.clientX;
+      mouseY = e.clientY;
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (isDead) return;
+      if (e.code === 'Space') sendAction('split');
+      if (e.code === 'KeyW') sendAction('eject');
+    });
+
+    window.addEventListener('touchstart', (e) => {
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (t.clientX < window.innerWidth / 2 && !touchJoystick) {
+          touchJoystick = { id: t.identifier, startX: t.clientX, startY: t.clientY, currX: t.clientX, currY: t.clientY };
+        }
+      }
+    });
+
+    window.addEventListener('touchmove', (e) => {
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (touchJoystick && t.identifier === touchJoystick.id) {
+          touchJoystick.currX = t.clientX;
+          touchJoystick.currY = t.clientY;
+        }
+      }
+    });
+
+    const endTouch = (e) => {
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (touchJoystick && e.changedTouches[i].identifier === touchJoystick.id) {
+          touchJoystick = null;
+        }
+      }
+    };
+    window.addEventListener('touchend', endTouch);
+    window.addEventListener('touchcancel', endTouch);
+
+    document.getElementById('btn-split').addEventListener('touchstart', (e) => { e.preventDefault(); if(!isDead) sendAction('split'); });
+    document.getElementById('btn-eject').addEventListener('touchstart', (e) => { e.preventDefault(); if(!isDead) sendAction('eject'); });
+
+    function updateOffsets() {
+      if (touchJoystick) {
+        const dx = touchJoystick.currX - touchJoystick.startX;
+        const dy = touchJoystick.currY - touchJoystick.startY;
+        const dist = Math.min(100, Math.hypot(dx, dy));
+        const angle = Math.atan2(dy, dx);
+        offsetX = Math.cos(angle) * dist;
+        offsetY = Math.sin(angle) * dist;
+      } else {
+        offsetX = mouseX - canvas.width / 2;
+        offsetY = mouseY - canvas.height / 2;
+      }
+    }
+
+    function sendAction(type) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type }));
+      }
+    }
+
+    function darkenColor(hex, percent = 0.25) {
+      if (!hex || !hex.startsWith('#')) return '#222222';
+      let num = parseInt(hex.slice(1), 16);
+      let r = Math.max(0, (num >> 16) - Math.round(255 * percent));
+      let g = Math.max(0, ((num >> 8) & 0x00ff) - Math.round(255 * percent));
+      let b = Math.max(0, (num & 0x0000ff) - Math.round(255 * percent));
+      return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+    }
+
+    function drawEntity(ctx, entity) {
+      ctx.save();
+      ctx.translate(entity.x, entity.y);
+
+      ctx.beginPath();
+      if (entity.isSpiky) {
+        const spikes = 20;
+        const outerRadius = entity.radius;
+        const innerRadius = entity.radius * 0.88;
+        for (let i = 0; i < spikes * 2; i++) {
+          const r = (i % 2 === 0) ? outerRadius : innerRadius;
+          const angle = (i / (spikes * 2)) * Math.PI * 2;
+          const x = Math.cos(angle) * r;
+          const y = Math.sin(angle) * r;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+      } else {
+        ctx.arc(0, 0, entity.radius, 0, Math.PI * 2);
+      }
+
+      ctx.fillStyle = entity.color || '#fff';
+      ctx.fill();
+
+      ctx.strokeStyle = darkenColor(entity.color, 0.25);
+      ctx.lineWidth = Math.max(2, entity.radius * 0.06);
+      ctx.stroke();
+
+      if (entity.name) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${Math.max(12, entity.radius * 0.35)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(entity.name, 0, entity.mass ? -entity.radius * 0.15 : 0);
+
+        if (entity.mass && entity.radius > 18) {
+          ctx.font = `${Math.max(10, entity.radius * 0.25)}px sans-serif`;
+          ctx.fillText(Math.floor(entity.mass), 0, entity.radius * 0.25);
+        }
+      }
+
+      ctx.restore();
+    }
+
+    function interpolateEntitiesAndRemotePlayers(dt) {
+      const lerpSpeed = Math.min(1, 0.35 * dt);
+
+      clientEntitiesMap.forEach(cEnt => {
+        cEnt.x += (cEnt.targetX - cEnt.x) * lerpSpeed;
+        cEnt.y += (cEnt.targetY - cEnt.y) * lerpSpeed;
+        if (cEnt.targetMass !== undefined) {
+          cEnt.mass += (cEnt.targetMass - cEnt.mass) * lerpSpeed;
+          cEnt.radius = getRadius(cEnt.mass);
+        }
+      });
+
+      clientPlayersMap.forEach((pObj, pId) => {
+        if (pId === myPlayerId) return;
+        pObj.cells.forEach(cCell => {
+          cCell.x += (cCell.targetX - cCell.x) * lerpSpeed;
+          cCell.y += (cCell.targetY - cCell.y) * lerpSpeed;
+          if (cCell.targetMass !== undefined) {
+            cCell.mass += (cCell.targetMass - cCell.mass) * lerpSpeed;
+            cCell.radius = getRadius(cCell.mass);
+          }
+        });
+      });
+    }
+
+    function predictLocalPhysics(dt) {
+      if (isDead || localCells.length === 0) return;
+
+      const mouseWorldX = camera.x + (offsetX / camera.scale);
+      const mouseWorldY = camera.y + (offsetY / camera.scale);
+
+      localCells.forEach(cell => {
+        const dx = mouseWorldX - cell.x;
+        const dy = mouseWorldY - cell.y;
+        const distToMouse = Math.hypot(dx, dy);
+        const angle = Math.atan2(dy, dx);
+        const distScale = Math.min(1, distToMouse / 100);
+
+        if (distToMouse > 5) {
+          const baseSpeed = Math.max(1.5, 14 * Math.pow(cell.mass, -0.25)) * distScale;
+          cell.vx = (cell.vx || 0) + Math.cos(angle) * baseSpeed * 0.25 * dt;
+          cell.vy = (cell.vy || 0) + Math.sin(angle) * baseSpeed * 0.25 * dt;
+        }
+
+        cell.x += (cell.vx || 0) * dt;
+        cell.y += (cell.vy || 0) * dt;
+
+        if (cell.targetX !== undefined && cell.targetY !== undefined) {
+          cell.x += (cell.targetX - cell.x) * 0.15 * dt;
+          cell.y += (cell.targetY - cell.y) * 0.15 * dt;
+        }
+
+        cell.vx = (cell.vx || 0) * Math.pow(0.85, dt);
+        cell.vy = (cell.vy || 0) * Math.pow(0.85, dt);
+
+        cell.x = Math.max(cell.radius, Math.min(worldSize - cell.radius, cell.x));
+        cell.y = Math.max(cell.radius, Math.min(worldSize - cell.radius, cell.y));
+
+        if (cell.targetMass !== undefined) {
+          cell.mass += (cell.targetMass - cell.mass) * 0.2 * dt;
+          cell.radius = getRadius(cell.mass);
+        }
+
+        clientEntitiesMap.forEach(e => {
+          if (e.type === 'food' && !e.eatenLocally) {
+            const foodDist = Math.hypot(cell.x - e.x, cell.y - e.y);
+            if (foodDist <= cell.radius + e.radius + 8) {
+              e.eatenLocally = true;
+              cell.mass += e.mass;
+              cell.radius = getRadius(cell.mass);
+            }
+          }
+        });
+      });
+    }
+
+    let lastTime = 0;
+
+    function render(time) {
+      if (!lastTime) lastTime = time;
+      let dt = (time - lastTime) / (1000 / 30);
+      dt = Math.min(dt, 3);
+      lastTime = time;
+
+      updateOffsets();
+
+      const nowMs = Date.now();
+      if (!isDead && ws && ws.readyState === WebSocket.OPEN && nowMs - lastTargetSend > 33) {
+        ws.send(JSON.stringify({ type: 'target', offsetX, offsetY }));
+        lastTargetSend = nowMs;
+      }
+
+      interpolateEntitiesAndRemotePlayers(dt);
+      predictLocalPhysics(dt);
+
+      if (!isDead && localCells.length > 0) {
+        camera.targetX = localCells.reduce((sum, c) => sum + c.x, 0) / localCells.length;
+        camera.targetY = localCells.reduce((sum, c) => sum + c.y, 0) / localCells.length;
+
+        const totalMass = localCells.reduce((sum, c) => sum + c.mass, 0);
+        const screenMin = Math.min(canvas.width, canvas.height);
+        
+        // Agar.io classic scale formula: proportional to total mass power + wheel zoom multiplier
+        const massScaleFactor = Math.pow(Math.min(64 / Math.max(15, totalMass), 1), 0.4);
+        camera.targetScale = Math.max(0.05, Math.min(2.0, (screenMin / 1080) * massScaleFactor * zoomMultiplier * 1.5));
+      } else {
+        camera.targetX = worldSize / 2;
+        camera.targetY = worldSize / 2;
+        camera.targetScale = 1.0;
+        zoomMultiplier = 1;
+      }
+
+      const camLerp = Math.min(1, 0.1 * dt);
+      camera.x += (camera.targetX - camera.x) * camLerp;
+      camera.y += (camera.targetY - camera.y) * camLerp;
+      camera.scale += (camera.targetScale - camera.scale) * camLerp;
+
+      ctx.fillStyle = '#181818';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.save();
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.scale(camera.scale, camera.scale);
+      ctx.translate(-camera.x, -camera.y);
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+      ctx.lineWidth = 1;
+      const gridSize = 60;
+      for (let x = 0; x <= worldSize; x += gridSize) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, worldSize); ctx.stroke();
+      }
+      for (let y = 0; y <= worldSize; y += gridSize) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(worldSize, y); ctx.stroke();
+      }
+
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 8;
+      ctx.strokeRect(0, 0, worldSize, worldSize);
+
+      const renderList = [];
+
+      clientEntitiesMap.forEach(entity => {
+        if (!entity.eatenLocally) {
+          renderList.push(entity);
+        }
+      });
+
+      clientPlayersMap.forEach((player, pId) => {
+        if (pId === myPlayerId) return;
+        player.cells.forEach(cell => {
+          renderList.push({ ...cell, color: player.color, name: player.name, isSpiky: false });
+        });
+      });
+
+      if (!isDead) {
+        const myPlayer = clientPlayersMap.get(myPlayerId);
+        const color = myPlayer ? myPlayer.color : '#fff';
+        const name = myPlayer ? myPlayer.name : '';
+
+        localCells.forEach(cell => {
+          renderList.push({ ...cell, color, name, isSpiky: false });
+        });
+      }
+
+      renderList.sort((a, b) => (a.radius || 0) - (b.radius || 0));
+      renderList.forEach(entity => drawEntity(ctx, entity));
+
+      ctx.restore();
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+      ctx.lineWidth = 2;
+      const lbWidth = 200;
+      const lbHeight = 36 + Math.max(1, leaderboardData.length) * 22;
+      const lbX = canvas.width - lbWidth - 20;
+      const lbY = 20;
+
+      ctx.fillRect(lbX, lbY, lbWidth, lbHeight);
+      ctx.strokeRect(lbX, lbY, lbWidth, lbHeight);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText('Leaderboard', lbX + lbWidth / 2, lbY + 10);
+
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'left';
+      if (leaderboardData.length === 0) {
+        ctx.fillStyle = '#888';
+        ctx.fillText('Waiting for players...', lbX + 12, lbY + 36);
+      } else {
+        leaderboardData.forEach((item, index) => {
+          const text = `${index + 1}. ${item.name || 'Unnamed'} (${item.mass})`;
+          const isMe = item.id === myPlayerId;
+          ctx.fillStyle = isMe ? '#3b82f6' : '#ffffff';
+          ctx.fillText(text, lbX + 12, lbY + 36 + index * 22);
+        });
+      }
+      ctx.restore();
+
+      if (touchJoystick) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(touchJoystick.startX, touchJoystick.startY, 45, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(touchJoystick.currX, touchJoystick.currY, 20, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+        ctx.fill();
+        ctx.restore();
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
