@@ -9,213 +9,386 @@ const wss = new WebSocket.Server({ server });
 app.use(express.static('public'));
 
 const WORLD_SIZE = 8000;
-const MAX_FOOD = 1200;
-const MAX_VIRUSES = 30;
+const INITIAL_MASS = 20;
+const MIN_SPLIT_MASS = 36;
+const EJECT_MASS_COST = 15;
+const EJECT_MASS_VALUE = 12;
+const FOOD_MASS = 5;
+const MAX_PLAYER_CELLS = 16;
+const FOOD_COUNT = 500;
+const VIRUS_COUNT = 30;
+const BOT_COUNT = 10;
+const SPAWN_PROTECTION_DURATION = 5000; // 5 seconds of spawn protection
 
-let entities = []; // Contains food, viruses, ejected mass
-let players = new Map(); // Map of player objects
-let nextEntityId = 1;
+const COLORS = ['#ff4d4d', '#33ca7f', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899'];
 
-const getRadius = (mass) => Math.sqrt(mass) * 6;
+let entities = [];
+let players = {};
+let entityIdCounter = 1;
+let frameCounter = 0;
 
-function getRandomColor() {
-  const letters = '0123456789ABCDEF';
-  let color = '#';
-  for (let i = 0; i < 6; i++) {
-    color += letters[Math.floor(Math.random() * 16)];
-  }
-  return color;
+function massToRadius(mass) {
+  return Math.sqrt(mass) * 6;
+}
+
+function distToSegmentSquared(px, py, ax, ay, bx, by) {
+  const l2 = (bx - ax) ** 2 + (by - ay) ** 2;
+  if (l2 === 0) return (px - ax) ** 2 + (py - ay) ** 2;
+  let t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
+  t = Math.max(0, Math.min(1, t));
+  const projX = ax + t * (bx - ax);
+  const projY = ay + t * (by - ay);
+  return (px - projX) ** 2 + (py - projY) ** 2;
 }
 
 function initWorld() {
-  for (let i = 0; i < MAX_FOOD; i++) {
-    entities.push({
-      id: nextEntityId++,
-      type: 'food',
-      x: Math.random() * WORLD_SIZE,
-      y: Math.random() * WORLD_SIZE,
-      mass: 1,
-      radius: getRadius(1),
-      color: getRandomColor()
-    });
-  }
-
-  for (let i = 0; i < MAX_VIRUSES; i++) {
-    entities.push({
-      id: nextEntityId++,
-      type: 'virus',
-      isSpiky: true,
-      x: Math.random() * (WORLD_SIZE - 400) + 200,
-      y: Math.random() * (WORLD_SIZE - 400) + 200,
-      mass: 100,
-      radius: getRadius(100),
-      color: '#33ff33'
-    });
-  }
+  for (let i = 0; i < FOOD_COUNT; i++) spawnFood();
+  for (let i = 0; i < VIRUS_COUNT; i++) spawnVirus();
+  for (let i = 0; i < BOT_COUNT; i++) spawnBot();
 }
-initWord = initWorld();
+
+function spawnFood() {
+  entities.push({
+    id: entityIdCounter++,
+    type: 'food',
+    x: Math.random() * WORLD_SIZE,
+    y: Math.random() * WORLD_SIZE,
+    mass: FOOD_MASS,
+    radius: massToRadius(FOOD_MASS),
+    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    isSpiky: false
+  });
+}
+
+function spawnVirus() {
+  const mass = 100;
+  entities.push({
+    id: entityIdCounter++,
+    type: 'virus',
+    x: Math.random() * (WORLD_SIZE - 400) + 200,
+    y: Math.random() * (WORLD_SIZE - 400) + 200,
+    mass: mass,
+    radius: massToRadius(mass),
+    color: '#33cc33',
+    isSpiky: true
+  });
+}
+
+function spawnBot() {
+  const botId = 'bot_' + Math.random().toString(36).substr(2, 9);
+  const now = Date.now();
+
+  players[botId] = {
+    id: botId,
+    name: 'Bot_' + Math.floor(Math.random() * 900 + 100),
+    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    isBot: true,
+    wanderTarget: null,
+    cells: [{
+      id: entityIdCounter++,
+      x: Math.random() * (WORLD_SIZE - 1000) + 500,
+      y: Math.random() * (WORLD_SIZE - 1000) + 500,
+      prevX: 0,
+      prevY: 0,
+      vx: 0,
+      vy: 0,
+      mass: INITIAL_MASS,
+      radius: massToRadius(INITIAL_MASS),
+      canMergeAfter: 0,
+      spawnProtectedUntil: now + SPAWN_PROTECTION_DURATION
+    }],
+    input: { offsetX: 0, offsetY: 0 }
+  };
+}
 
 wss.on('connection', (ws) => {
-  const playerId = nextEntityId++;
-  let player = {
+  const playerId = 'player_' + Math.random().toString(36).substr(2, 9);
+  ws.playerId = playerId;
+  const now = Date.now();
+  
+  players[playerId] = {
     id: playerId,
-    name: 'Unnamed',
-    color: getRandomColor(),
-    cells: [],
-    ws: ws
+    name: 'Cell',
+    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    isBot: false,
+    cells: [{
+      id: entityIdCounter++,
+      x: Math.random() * (WORLD_SIZE - 1000) + 500,
+      y: Math.random() * (WORLD_SIZE - 1000) + 500,
+      prevX: 0,
+      prevY: 0,
+      vx: 0,
+      vy: 0,
+      mass: INITIAL_MASS,
+      radius: massToRadius(INITIAL_MASS),
+      canMergeAfter: 0,
+      spawnProtectedUntil: now + SPAWN_PROTECTION_DURATION
+    }],
+    input: { offsetX: 0, offsetY: 0 }
   };
 
-  players.set(playerId, player);
-
-  ws.send(JSON.stringify({
-    type: 'init',
-    playerId: playerId,
-    worldSize: WORLD_SIZE
-  }));
+  ws.send(JSON.stringify({ type: 'init', playerId, worldSize: WORLD_SIZE }));
 
   ws.on('message', (message) => {
     try {
-      const msg = JSON.parse(message);
+      const data = JSON.parse(message);
+      const p = players[playerId];
+      if (!p) return;
 
-      if (msg.type === 'join') {
-        player.name = msg.name.slice(0, 12) || 'Unnamed';
-        // Spawn initial cell
-        player.cells.push({
-          id: nextEntityId++,
-          x: Math.random() * (WORLD_SIZE - 1000) + 500,
-          y: Math.random() * (WORLD_SIZE - 1000) + 500,
-          mass: 15,
-          radius: getRadius(15),
-          vx: 0,
-          vy: 0,
-          canMergeAfter: Date.now() + 30000
-        });
-      } else if (msg.type === 'target') {
-        player.targetOffsetX = msg.offsetX;
-        player.targetOffsetY = msg.offsetY;
-      } else if (msg.type === 'split') {
-        splitPlayerCells(player);
-      } else if (msg.type === 'eject') {
-        ejectMass(player);
+      if (data.type === 'join') {
+        p.name = data.name.trim().slice(0, 12) || 'Unnamed';
+        if (p.cells.length === 0) {
+          const spawnX = Math.random() * (WORLD_SIZE - 1000) + 500;
+          const spawnY = Math.random() * (WORLD_SIZE - 1000) + 500;
+          const respawnNow = Date.now();
+          p.cells = [{
+            id: entityIdCounter++,
+            x: spawnX,
+            y: spawnY,
+            prevX: spawnX,
+            prevY: spawnY,
+            vx: 0,
+            vy: 0,
+            mass: INITIAL_MASS,
+            radius: massToRadius(INITIAL_MASS),
+            canMergeAfter: 0,
+            spawnProtectedUntil: respawnNow + SPAWN_PROTECTION_DURATION
+          }];
+        }
+      } else if (data.type === 'target') {
+        p.input.offsetX = data.offsetX;
+        p.input.offsetY = data.offsetY;
+      } else if (data.type === 'split') {
+        splitPlayer(p);
+      } else if (data.type === 'eject') {
+        ejectMass(p);
       }
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) {}
   });
 
-  ws.on('close', () => {
-    players.delete(playerId);
-  });
+  ws.on('close', () => { if (ws.playerId) delete players[ws.playerId]; });
+  ws.on('error', () => { if (ws.playerId) delete players[ws.playerId]; });
 });
 
-function splitPlayerCells(player) {
+function splitPlayer(player) {
+  if (player.cells.length >= MAX_PLAYER_CELLS) return;
+
   const newCells = [];
+  const now = Date.now();
+
   player.cells.forEach(cell => {
-    if (cell.mass >= 36 && player.cells.length + newCells.length < 16) {
-      const halfMass = cell.mass / 2;
-      cell.mass = halfMass;
-      cell.radius = getRadius(cell.mass);
+    if (cell.mass >= MIN_SPLIT_MASS && player.cells.length + newCells.length < MAX_PLAYER_CELLS) {
+      cell.mass /= 2;
+      cell.radius = massToRadius(cell.mass);
+      cell.canMergeAfter = now + 15000;
 
-      const angle = Math.atan2(player.targetOffsetY || 0, player.targetOffsetX || 1);
-      const splitDist = cell.radius * 2;
+      let avgX = 0, avgY = 0;
+      player.cells.forEach(c => { avgX += c.x; avgY += c.y; });
+      avgX /= player.cells.length;
+      avgY /= player.cells.length;
+      const mouseWorldX = avgX + (player.input.offsetX || 0);
+      const mouseWorldY = avgY + (player.input.offsetY || 0);
 
-      newCells.push({
-        id: nextEntityId++,
-        x: cell.x + Math.cos(angle) * splitDist,
-        y: cell.y + Math.sin(angle) * splitDist,
-        mass: halfMass,
-        radius: getRadius(halfMass),
-        vx: Math.cos(angle) * 25,
-        vy: Math.sin(angle) * 25,
-        canMergeAfter: Date.now() + 15000
-      });
+      const angle = Math.atan2(mouseWorldY - cell.y, mouseWorldX - cell.x);
+      const splitImpulse = 52;
+      const targetX = cell.x + Math.cos(angle) * (cell.radius + 5);
+      const targetY = cell.y + Math.sin(angle) * (cell.radius + 5);
+
+      const splitCell = {
+        id: entityIdCounter++,
+        x: targetX,
+        y: targetY,
+        prevX: cell.x,
+        prevY: cell.y,
+        vx: Math.cos(angle) * splitImpulse,
+        vy: Math.sin(angle) * splitImpulse,
+        mass: cell.mass,
+        radius: cell.radius,
+        canMergeAfter: now + 15000,
+        spawnProtectedUntil: cell.spawnProtectedUntil // Inherit protection if active
+      };
+      newCells.push(splitCell);
     }
   });
+
   player.cells.push(...newCells);
 }
 
 function ejectMass(player) {
-  const ejected = [];
-  player.cells.forEach(cell => {
-    if (cell.mass >= 36) {
-      cell.mass -= 14;
-      cell.radius = getRadius(cell.mass);
+  let avgX = 0, avgY = 0;
+  player.cells.forEach(c => { avgX += c.x; avgY += c.y; });
+  avgX /= player.cells.length;
+  avgY /= player.cells.length;
+  const mouseWorldX = avgX + (player.input.offsetX || 0);
+  const mouseWorldY = avgY + (player.input.offsetY || 0);
 
-      const angle = Math.atan2(player.targetOffsetY || 0, player.targetOffsetX || 1);
-      ejected.push({
-        id: nextEntityId++,
+  player.cells.forEach(cell => {
+    if (cell.mass >= INITIAL_MASS + EJECT_MASS_COST) {
+      cell.mass -= EJECT_MASS_COST;
+      cell.radius = massToRadius(cell.mass);
+
+      const angle = Math.atan2(mouseWorldY - cell.y, mouseWorldX - cell.x);
+      const spawnDist = cell.radius + 10;
+
+      entities.push({
+        id: entityIdCounter++,
         type: 'ejected',
-        x: cell.x + Math.cos(angle) * (cell.radius + 15),
-        y: cell.y + Math.sin(angle) * (cell.radius + 15),
-        mass: 12,
-        radius: getRadius(12),
+        x: cell.x + Math.cos(angle) * spawnDist,
+        y: cell.y + Math.sin(angle) * spawnDist,
+        vx: Math.cos(angle) * 90,
+        vy: Math.sin(angle) * 90,
+        mass: EJECT_MASS_VALUE,
+        radius: massToRadius(EJECT_MASS_VALUE),
         color: player.color,
-        vx: Math.cos(angle) * 18,
-        vy: Math.sin(angle) * 18
+        isSpiky: false
       });
     }
   });
-  entities.push(...ejected);
 }
 
-// Main Game Loop (30 FPS)
+function explodeCellOnVirus(player, cell) {
+  const maxNew = MAX_PLAYER_CELLS - player.cells.length;
+  if (maxNew <= 0) return;
+
+  const pieces = Math.min(maxNew, Math.floor(cell.mass / 20));
+  if (pieces <= 0) return;
+
+  const newMass = cell.mass / (pieces + 1);
+  cell.mass = newMass;
+  cell.radius = massToRadius(newMass);
+  cell.canMergeAfter = Date.now() + 20000;
+
+  for (let i = 0; i < pieces; i++) {
+    const angle = (Math.PI * 2 / pieces) * i;
+    player.cells.push({
+      id: entityIdCounter++,
+      x: cell.x,
+      y: cell.y,
+      prevX: cell.x,
+      prevY: cell.y,
+      vx: Math.cos(angle) * 20,
+      vy: Math.sin(angle) * 20,
+      mass: newMass,
+      radius: massToRadius(newMass),
+      canMergeAfter: Date.now() + 20000,
+      spawnProtectedUntil: cell.spawnProtectedUntil
+    });
+  }
+}
+
+// Physics Loop (30 FPS)
 setInterval(() => {
   const now = Date.now();
+  frameCounter++;
 
-  // 1. Update Viruses (Soft Overlap / Push-apart Physics)
-  let viruses = entities.filter(e => e.type === 'virus');
-  for (let i = 0; i < viruses.length; i++) {
-    for (let j = i + 1; j < viruses.length; j++) {
-      let v1 = viruses[i];
-      let v2 = viruses[j];
-      let dx = v2.x - v1.x;
-      let dy = v2.y - v1.y;
-      let dist = Math.hypot(dx, dy);
-      let minDist = v1.radius + v2.radius;
+  // Bots
+  Object.values(players).forEach((p, index) => {
+    if (p.isBot && p.cells.length > 0) {
+      if (index % 5 !== frameCounter % 5) return;
 
-      if (dist < minDist) {
-        let overlap = minDist - dist;
-        let angle = Math.atan2(dy, dx);
-        let push = overlap * 0.15;
+      const cell = p.cells[0];
+      let nearestFood = null;
+      let minDistFood = Infinity;
 
-        // Smoothly push both viruses apart while allowing overlap intersection
-        v1.x -= Math.cos(angle) * push;
-        v1.y -= Math.sin(angle) * push;
-        v2.x += Math.cos(angle) * push;
-        v2.y += Math.sin(angle) * push;
+      for (let i = 0; i < entities.length; i++) {
+        const e = entities[i];
+        if (e.type === 'food') {
+          const dist = Math.hypot(e.x - cell.x, e.y - cell.y);
+          if (dist < minDistFood) {
+            minDistFood = dist;
+            nearestFood = e;
+          }
+        }
+      }
 
-        v1.x = Math.max(v1.radius, Math.min(WORLD_SIZE - v1.radius, v1.x));
-        v1.y = Math.max(v1.radius, Math.min(WORLD_SIZE - v1.radius, v1.y));
-        v2.x = Math.max(v2.radius, Math.min(WORLD_SIZE - v2.radius, v2.x));
-        v2.y = Math.max(v2.radius, Math.min(WORLD_SIZE - v2.radius, v2.y));
+      let nearestThreat = null;
+      let minDistThreat = Infinity;
+      Object.values(players).forEach(otherP => {
+        if (otherP.id === p.id) return;
+        otherP.cells.forEach(oCell => {
+          if (oCell.mass > cell.mass * 1.1) {
+            const dist = Math.hypot(oCell.x - cell.x, oCell.y - cell.y);
+            if (dist < minDistThreat) {
+              minDistThreat = dist;
+              nearestThreat = oCell;
+            }
+          }
+        });
+      });
+
+      let targetWorldX = cell.x;
+      let targetWorldY = cell.y;
+
+      if (nearestThreat && minDistThreat < 400) {
+        const angle = Math.atan2(cell.y - nearestThreat.y, cell.x - nearestThreat.x);
+        targetWorldX = cell.x + Math.cos(angle) * 100;
+        targetWorldY = cell.y + Math.sin(angle) * 100;
+      } else if (nearestFood && minDistFood < 500) {
+        targetWorldX = nearestFood.x;
+        targetWorldY = nearestFood.y;
+      } else {
+        if (!p.wanderTarget || Math.hypot(p.wanderTarget.x - cell.x, p.wanderTarget.y - cell.y) < 100) {
+          p.wanderTarget = {
+            x: Math.max(200, Math.min(WORLD_SIZE - 200, cell.x + (Math.random() - 0.5) * 1500)),
+            y: Math.max(200, Math.min(WORLD_SIZE - 200, cell.y + (Math.random() - 0.5) * 1500))
+          };
+        }
+        targetWorldX = p.wanderTarget.x;
+        targetWorldY = p.wanderTarget.y;
+      }
+
+      p.input.offsetX = targetWorldX - cell.x;
+      p.input.offsetY = targetWorldY - cell.y;
+    }
+  });
+
+  // Ejected Mass Movement
+  for (let i = entities.length - 1; i >= 0; i--) {
+    const e = entities[i];
+    if (e.type === 'ejected') {
+      e.x += e.vx;
+      e.y += e.vy;
+      e.vx *= 0.82;
+      e.vy *= 0.82;
+
+      if (e.x < 0 || e.x > WORLD_SIZE || e.y < 0 || e.y > WORLD_SIZE) {
+        entities.splice(i, 1);
       }
     }
   }
 
-  // 2. Replenish Food
-  while (entities.filter(e => e.type === 'food').length < MAX_FOOD) {
-    entities.push({
-      id: nextEntityId++,
-      type: 'food',
-      x: Math.random() * WORLD_SIZE,
-      y: Math.random() * WORLD_SIZE,
-      mass: 1,
-      radius: getRadius(1),
-      color: getRandomColor()
-    });
-  }
+  // Player & Cell Movement (Per-Cell Mouse Targeting)
+  Object.values(players).forEach(p => {
+    const offsetX = p.input.offsetX || 0;
+    const offsetY = p.input.offsetY || 0;
 
-  // 3. Update Player Cells & Interactions
-  players.forEach(player => {
-    player.cells.forEach(cell => {
-      if (player.targetOffsetX !== undefined && player.targetOffsetY !== undefined) {
-        const dist = Math.hypot(player.targetOffsetX, player.targetOffsetY);
-        if (dist > 5) {
-          const angle = Math.atan2(player.targetOffsetY, player.targetOffsetX);
-          const speed = Math.max(1.2, 12 * Math.pow(cell.mass, -0.25));
-          cell.vx += Math.cos(angle) * speed * 0.2;
-          cell.vy += Math.sin(angle) * speed * 0.2;
-        }
+    let avgX = 0, avgY = 0;
+    p.cells.forEach(c => { avgX += c.x; avgY += c.y; });
+    if (p.cells.length > 0) {
+      avgX /= p.cells.length;
+      avgY /= p.cells.length;
+    } else {
+      avgX = WORLD_SIZE / 2;
+      avgY = WORLD_SIZE / 2;
+    }
+
+    const mouseWorldX = avgX + offsetX;
+    const mouseWorldY = avgY + offsetY;
+
+    p.cells.forEach(cell => {
+      cell.prevX = cell.x;
+      cell.prevY = cell.y;
+
+      const dx = mouseWorldX - cell.x;
+      const dy = mouseWorldY - cell.y;
+      const distToMouse = Math.hypot(dx, dy);
+      const angle = Math.atan2(dy, dx);
+      const distScale = Math.min(1, distToMouse / 100);
+
+      if (distToMouse > 5) {
+        const baseSpeed = Math.max(1.5, 14 * Math.pow(cell.mass, -0.25)) * distScale;
+        cell.vx += Math.cos(angle) * baseSpeed * 0.25;
+        cell.vy += Math.sin(angle) * baseSpeed * 0.25;
       }
 
       cell.x += cell.vx;
@@ -226,73 +399,179 @@ setInterval(() => {
       cell.x = Math.max(cell.radius, Math.min(WORLD_SIZE - cell.radius, cell.x));
       cell.y = Math.max(cell.radius, Math.min(WORLD_SIZE - cell.radius, cell.y));
 
-      // Food Collision
-      entities = entities.filter(entity => {
-        if (entity.type === 'food' || entity.type === 'ejected') {
-          const d = Math.hypot(cell.x - entity.x, cell.y - entity.y);
-          if (d < cell.radius + entity.radius) {
-            cell.mass += entity.mass;
-            cell.radius = getRadius(cell.mass);
-            return false;
+      if (cell.mass > INITIAL_MASS * 2) {
+        cell.mass -= cell.mass * 0.00008;
+        cell.radius = massToRadius(cell.mass);
+      }
+    });
+
+    // Same-player cell collisions & merging
+    for (let pass = 0; pass < 4; pass++) {
+      for (let i = 0; i < p.cells.length; i++) {
+        for (let j = i + 1; j < p.cells.length; j++) {
+          const c1 = p.cells[i];
+          const c2 = p.cells[j];
+          const dx = c2.x - c1.x;
+          const dy = c2.y - c1.y;
+          const cellDist = Math.hypot(dx, dy) || 1;
+          const minDist = c1.radius + c2.radius;
+
+          if (now > c1.canMergeAfter && now > c2.canMergeAfter) {
+            if (cellDist < c1.radius + c2.radius * 0.3) {
+              c1.mass += c2.mass;
+              c1.radius = massToRadius(c1.mass);
+              p.cells.splice(j, 1);
+              j--;
+            }
+          } else if (cellDist < minDist) {
+            const overlap = minDist - cellDist;
+            const nx = dx / cellDist;
+            const ny = dy / cellDist;
+
+            const totalMass = c1.mass + c2.mass;
+            const r1 = c2.mass / totalMass;
+            const r2 = c1.mass / totalMass;
+
+            c1.x -= nx * overlap * r1;
+            c1.y -= ny * overlap * r1;
+            c2.x += nx * overlap * r2;
+            c2.y += ny * overlap * r2;
+
+            const rvx = c2.vx - c1.vx;
+            const rvy = c2.vy - c1.vy;
+            const velAlongNormal = rvx * nx + rvy * ny;
+            if (velAlongNormal < 0) {
+              const impulse = -velAlongNormal * 0.8;
+              c1.vx -= nx * impulse * r1;
+              c1.vy -= ny * impulse * r1;
+              c2.vx += nx * impulse * r2;
+              c2.vy += ny * impulse * r2;
+            }
           }
         }
-        return true;
-      });
+      }
+    }
+  });
+
+  // Food, Ejected Mass, and Virus Collisions for all player cells
+  Object.values(players).forEach(p => {
+    p.cells.forEach(cell => {
+      for (let i = entities.length - 1; i >= 0; i--) {
+        const e = entities[i];
+
+        if (e.type === 'food') {
+          const maxEatDist = cell.radius + e.radius + 8;
+          const distSq = distToSegmentSquared(e.x, e.y, cell.prevX, cell.prevY, cell.x, cell.y);
+
+          if (distSq <= maxEatDist * maxEatDist) {
+            cell.mass += e.mass;
+            cell.radius = massToRadius(cell.mass);
+            entities.splice(i, 1);
+            spawnFood();
+          }
+        } else if (e.type === 'ejected') {
+          const dist = Math.hypot(cell.x - e.x, cell.y - e.y);
+          if (dist <= cell.radius + e.radius * 0.5 + 5) {
+            cell.mass += e.mass;
+            cell.radius = massToRadius(cell.mass);
+            entities.splice(i, 1);
+          }
+        } else if (e.type === 'virus') {
+          const dist = Math.hypot(cell.x - e.x, cell.y - e.y);
+          if (dist < cell.radius + e.radius) {
+            if (cell.mass > e.mass * 1.15) {
+              explodeCellOnVirus(p, cell);
+              entities.splice(i, 1);
+              spawnVirus();
+            }
+          }
+        }
+      }
     });
   });
 
-  // Build Leaderboard Data
-  let allPlayersArray = [];
-  players.forEach(p => {
-    let totalMass = p.cells.reduce((sum, c) => sum + c.mass, 0);
-    allPlayersArray.push({ id: p.id, name: p.name, mass: Math.floor(totalMass) });
+  // Player vs Player Eating (Overlap Pass - Spawn Protected cells cannot be eaten)
+  const allPlayerCells = [];
+  Object.values(players).forEach(p => {
+    p.cells.forEach(cell => {
+      allPlayerCells.push({ player: p, cell: cell });
+    });
   });
-  allPlayersArray.sort((a, b) => b.mass - a.mass);
-  const leaderboard = allPlayersArray.slice(0, 10);
 
-  // Prepare State Payload
-  const serializedPlayers = [];
-  players.forEach(p => {
-    serializedPlayers.push({
+  const cellsToRemove = new Set();
+
+  for (let i = 0; i < allPlayerCells.length; i++) {
+    const item1 = allPlayerCells[i];
+    if (cellsToRemove.has(item1.cell)) continue;
+
+    for (let j = i + 1; j < allPlayerCells.length; j++) {
+      const item2 = allPlayerCells[j];
+      if (cellsToRemove.has(item2.cell)) continue;
+      if (item1.player.id === item2.player.id) continue;
+
+      const c1 = item1.cell;
+      const c2 = item2.cell;
+
+      const dist = Math.hypot(c2.x - c1.x, c2.y - c1.y);
+
+      const c1Protected = now < c1.spawnProtectedUntil;
+      const c2Protected = now < c2.spawnProtectedUntil;
+
+      if (!c2Protected && c1.mass > c2.mass * 1.10 && dist < c1.radius) {
+        c1.mass += c2.mass;
+        c1.radius = massToRadius(c1.mass);
+        cellsToRemove.add(c2);
+      } else if (!c1Protected && c2.mass > c1.mass * 1.10 && dist < c2.radius) {
+        c2.mass += c1.mass;
+        c2.radius = massToRadius(c2.mass);
+        cellsToRemove.add(c1);
+        break;
+      }
+    }
+  }
+
+  if (cellsToRemove.size > 0) {
+    Object.values(players).forEach(p => {
+      p.cells = p.cells.filter(cell => !cellsToRemove.has(cell));
+    });
+  }
+
+  const activeBots = Object.values(players).filter(p => p.isBot).length;
+  for (let i = activeBots; i < BOT_COUNT; i++) {
+    spawnBot();
+  }
+
+  const leaderboard = Object.values(players).map(p => {
+    const totalMass = p.cells.reduce((sum, c) => sum + c.mass, 0);
+    return { id: p.id, name: p.name || 'Unnamed', mass: Math.floor(totalMass) };
+  }).sort((a, b) => b.mass - a.mass).slice(0, 10);
+
+  const snapshot = JSON.stringify({
+    type: 'state',
+    entities,
+    leaderboard,
+    players: Object.values(players).map(p => ({
       id: p.id,
       name: p.name,
       color: p.color,
       cells: p.cells.map(c => ({
-        id: c.id,
-        x: c.x,
-        y: c.y,
-        mass: c.mass,
-        vx: c.vx,
-        vy: c.vy,
-        canMergeAfter: c.canMergeAfter
+        id: c.id, 
+        x: c.x, 
+        y: c.y, 
+        vx: c.vx, 
+        vy: c.vy, 
+        mass: c.mass, 
+        radius: c.radius, 
+        canMergeAfter: c.canMergeAfter,
+        spawnProtectedUntil: c.spawnProtectedUntil
       }))
-    });
+    }))
   });
 
-  const statePayload = JSON.stringify({
-    type: 'state',
-    entities: entities.map(e => ({
-      id: e.id,
-      type: e.type,
-      x: e.x,
-      y: e.y,
-      mass: e.mass,
-      color: e.color,
-      isSpiky: e.isSpiky
-    })),
-    players: serializedPlayers,
-    leaderboard
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(snapshot);
   });
-
-  players.forEach(p => {
-    if (p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(statePayload);
-    }
-  });
-
 }, 1000 / 30);
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+initWorld();
+server.listen(3000, () => console.log('Server running on http://localhost:3000'));
