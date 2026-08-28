@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const fs = require('fs');
+const net = require('net');
 
 const app = express();
 const server = http.createServer(app);
@@ -8,28 +10,105 @@ const wss = new WebSocket.Server({ server });
 
 app.use(express.static('public'));
 
-const WORLD_SIZE = 8000;
-const INITIAL_MASS = 20;
-const MIN_SPLIT_MASS = 36;
-const EJECT_MASS_COST = 15;
-const EJECT_MASS_VALUE = 12;
-const FOOD_MASS = 5;
-const MAX_PLAYER_CELLS = 16;
-const FOOD_COUNT = 500;
-const VIRUS_COUNT = 30;
-const BOT_COUNT = 10;
-const SPAWN_PROTECTION_DURATION = 5000; // 5 seconds of spawn protection
+// Parse config.ini
+const config = fs.readFileSync('./config.ini', 'utf-8')
+  .split(/\r?\n/)
+  .reduce((acc, line) => {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith(';')) {
+      const [key, value] = trimmed.split('=');
+      if (key && value) acc[key.trim()] = Number(value.trim());
+    }
+    return acc;
+  }, {});
 
+// Apply config variables using ?? to allow explicitly set 0 values
+const WORLD_SIZE = config.WORLD_SIZE ?? 8000;
+const INITIAL_MASS = config.INITIAL_MASS ?? 20;
+const MIN_SPLIT_MASS = config.MIN_SPLIT_MASS ?? 36;
+const EJECT_MASS_COST = config.EJECT_MASS_COST ?? 15;
+const EJECT_MASS_VALUE = config.EJECT_MASS_VALUE ?? 12;
+const FOOD_MASS = config.FOOD_MASS ?? 5;
+const MAX_PLAYER_CELLS = config.MAX_PLAYER_CELLS ?? 16;
+const FOOD_COUNT = config.FOOD_COUNT ?? 1000;
+const VIRUS_COUNT = config.VIRUS_COUNT ?? 30;
+const BOT_COUNT = config.BOT_COUNT ?? 10;
+const SPAWN_PROTECTION_DURATION = config.SPAWN_PROTECTION_DURATION ?? 5000;
+const MERGE_TIME = config.MERGE_TIME ?? 15;
 const COLORS = ['#ff4d4d', '#33ca7f', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899'];
+
+const CoreEntity = require('./entity/CoreEntity');
+const FoodEntity = require('./entity/Food');
+const VirusEntity = require('./entity/Virus');
+const EjectedEntity = require('./entity/EjectedMass');
+const PlayerCellEntity = require('./entity/PlayerCell');
+class SpatialGrid {
+  constructor(cellSize) {
+    this.cellSize = cellSize;
+    this.grid = new Map();
+  }
+
+  _hash(x, y) {
+    return `${Math.floor(x / this.cellSize)},${Math.floor(y / this.cellSize)}`;
+  }
+
+  insertEntity(entity) {
+    const key = this._hash(entity.x, entity.y);
+    if (!this.grid.has(key)) this.grid.set(key, { entities: [], players: new Map() });
+    this.grid.get(key).entities.push(entity);
+  }
+
+  insertPlayerCell(player, cell) {
+    const key = this._hash(cell.x, cell.y);
+    if (!this.grid.has(key)) this.grid.set(key, { entities: [], players: new Map() });
+    
+    const gridNode = this.grid.get(key);
+    if (!gridNode.players.has(player.id)) {
+      gridNode.players.set(player.id, {
+        id: player.id, name: player.name, color: player.color, skin: player.skin, cells: []
+      });
+    }
+    
+    gridNode.players.get(player.id).cells.push({
+      id: cell.id, x: cell.x, y: cell.y, vx: cell.vx, vy: cell.vy, mass: cell.mass, 
+      radius: cell.radius, isSpiky: cell.isSpiky, canMergeAfter: cell.canMergeAfter, 
+      spawnProtectedUntil: cell.spawnProtectedUntil
+    });
+  }
+
+  query(x, y, radius) {
+    const minX = Math.floor((x - radius) / this.cellSize);
+    const maxX = Math.floor((x + radius) / this.cellSize);
+    const minY = Math.floor((y - radius) / this.cellSize);
+    const maxY = Math.floor((y + radius) / this.cellSize);
+
+    const resultEntities = [];
+    const resultPlayersMap = new Map();
+
+    for (let gx = minX; gx <= maxX; gx++) {
+      for (let gy = minY; gy <= maxY; gy++) {
+        const key = `${gx},${gy}`;
+        const gridNode = this.grid.get(key);
+        if (gridNode) {
+          resultEntities.push(...gridNode.entities);
+          
+          gridNode.players.forEach((pData, pId) => {
+            if (!resultPlayersMap.has(pId)) {
+              resultPlayersMap.set(pId, { id: pData.id, name: pData.name, color: pData.color, skin: pData.skin, cells: [] });
+            }
+            resultPlayersMap.get(pId).cells.push(...pData.cells);
+          });
+        }
+      }
+    }
+    return { entities: resultEntities, players: Array.from(resultPlayersMap.values()) };
+  }
+}
 
 let entities = [];
 let players = {};
 let entityIdCounter = 1;
 let frameCounter = 0;
-
-function massToRadius(mass) {
-  return Math.sqrt(mass) * 6;
-}
 
 function distToSegmentSquared(px, py, ax, ay, bx, by) {
   const l2 = (bx - ax) ** 2 + (by - ay) ** 2;
@@ -48,55 +127,31 @@ function initWorld() {
 }
 
 function spawnFood() {
-  entities.push({
-    id: entityIdCounter++,
-    type: 'food',
-    x: Math.random() * WORLD_SIZE,
-    y: Math.random() * WORLD_SIZE,
-    mass: FOOD_MASS,
-    radius: massToRadius(FOOD_MASS),
-    color: COLORS[Math.floor(Math.random() * COLORS.length)],
-    isSpiky: false
-  });
+  const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+  entities.push(new FoodEntity(entityIdCounter++, Math.random() * WORLD_SIZE, Math.random() * WORLD_SIZE, color));
 }
 
 function spawnVirus() {
-  const mass = 100;
-  entities.push({
-    id: entityIdCounter++,
-    type: 'virus',
-    x: Math.random() * (WORLD_SIZE - 400) + 200,
-    y: Math.random() * (WORLD_SIZE - 400) + 200,
-    mass: mass,
-    radius: massToRadius(mass),
-    color: '#33cc33',
-    isSpiky: true
-  });
+  const x = Math.random() * (WORLD_SIZE - 400) + 200;
+  const y = Math.random() * (WORLD_SIZE - 400) + 200;
+  entities.push(new VirusEntity(entityIdCounter++, x, y));
 }
 
 function spawnBot() {
   const botId = 'bot_' + Math.random().toString(36).substr(2, 9);
   const now = Date.now();
+  const spawnX = Math.random() * (WORLD_SIZE - 1000) + 500;
+  const spawnY = Math.random() * (WORLD_SIZE - 1000) + 500;
+  const color = COLORS[Math.floor(Math.random() * COLORS.length)];
 
   players[botId] = {
     id: botId,
     name: 'Bot_' + Math.floor(Math.random() * 900 + 100),
-    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    color: color,
+    skin: null,
     isBot: true,
     wanderTarget: null,
-    cells: [{
-      id: entityIdCounter++,
-      x: Math.random() * (WORLD_SIZE - 1000) + 500,
-      y: Math.random() * (WORLD_SIZE - 1000) + 500,
-      prevX: 0,
-      prevY: 0,
-      vx: 0,
-      vy: 0,
-      mass: INITIAL_MASS,
-      radius: massToRadius(INITIAL_MASS),
-      canMergeAfter: 0,
-      spawnProtectedUntil: now + SPAWN_PROTECTION_DURATION
-    }],
+    cells: [new PlayerCellEntity(entityIdCounter++, spawnX, spawnY, INITIAL_MASS, color, now + SPAWN_PROTECTION_DURATION)],
     input: { offsetX: 0, offsetY: 0 }
   };
 }
@@ -105,25 +160,17 @@ wss.on('connection', (ws) => {
   const playerId = 'player_' + Math.random().toString(36).substr(2, 9);
   ws.playerId = playerId;
   const now = Date.now();
+  const spawnX = Math.random() * (WORLD_SIZE - 1000) + 500;
+  const spawnY = Math.random() * (WORLD_SIZE - 1000) + 500;
+  const color = COLORS[Math.floor(Math.random() * COLORS.length)];
   
   players[playerId] = {
     id: playerId,
     name: 'Cell',
-    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    color: color,
+    skin: null,
     isBot: false,
-    cells: [{
-      id: entityIdCounter++,
-      x: Math.random() * (WORLD_SIZE - 1000) + 500,
-      y: Math.random() * (WORLD_SIZE - 1000) + 500,
-      prevX: 0,
-      prevY: 0,
-      vx: 0,
-      vy: 0,
-      mass: INITIAL_MASS,
-      radius: massToRadius(INITIAL_MASS),
-      canMergeAfter: 0,
-      spawnProtectedUntil: now + SPAWN_PROTECTION_DURATION
-    }],
+    cells: [new PlayerCellEntity(entityIdCounter++, spawnX, spawnY, INITIAL_MASS, color, now + SPAWN_PROTECTION_DURATION)],
     input: { offsetX: 0, offsetY: 0 }
   };
 
@@ -137,24 +184,40 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'join') {
         p.name = data.name.trim().slice(0, 12) || 'Unnamed';
-        if (p.cells.length === 0) {
-          const spawnX = Math.random() * (WORLD_SIZE - 1000) + 500;
-          const spawnY = Math.random() * (WORLD_SIZE - 1000) + 500;
-          const respawnNow = Date.now();
-          p.cells = [{
-            id: entityIdCounter++,
-            x: spawnX,
-            y: spawnY,
-            prevX: spawnX,
-            prevY: spawnY,
-            vx: 0,
-            vy: 0,
-            mass: INITIAL_MASS,
-            radius: massToRadius(INITIAL_MASS),
-            canMergeAfter: 0,
-            spawnProtectedUntil: respawnNow + SPAWN_PROTECTION_DURATION
-          }];
+        p.skin = data.skin ? data.skin.trim().slice(0, 255) : null;
+        
+        if (p.cells.length > 0) {
+        let totalMass = 0;
+        let minX = Infinity, maxX = -Infinity;
+        let minY = Infinity, maxY = -Infinity;
+        let sumX = 0, sumY = 0;
+
+        for (let i = 0; i < p.cells.length; i++) {
+          const cell = p.cells[i];
+          totalMass += cell.mass;
+          sumX += cell.x; 
+          sumY += cell.y;
+          
+          // Calculate the outer physical boundaries of all cells
+          if (cell.x - cell.radius < minX) minX = cell.x - cell.radius;
+          if (cell.x + cell.radius > maxX) maxX = cell.x + cell.radius;
+          if (cell.y - cell.radius < minY) minY = cell.y - cell.radius;
+          if (cell.y + cell.radius > maxY) maxY = cell.y + cell.radius;
         }
+        
+        centerX = sumX / p.cells.length;
+        centerY = sumY / p.cells.length;
+        
+        const baseRadius = Math.sqrt(totalMass) * 6;
+        const spreadX = (maxX - minX) / 2;
+        const spreadY = (maxY - minY) / 2;
+        const actualSpreadRadius = Math.max(spreadX, spreadY);
+        
+        const targetRadius = Math.max(baseRadius, actualSpreadRadius);
+
+        // Match the client's 3.5x FOV padding + a little extra for network buffer
+        viewRadius = Math.max(1500, targetRadius * 4.5);
+      }
       } else if (data.type === 'target') {
         p.input.offsetX = data.offsetX;
         p.input.offsetY = data.offsetY;
@@ -179,8 +242,8 @@ function splitPlayer(player) {
   player.cells.forEach(cell => {
     if (cell.mass >= MIN_SPLIT_MASS && player.cells.length + newCells.length < MAX_PLAYER_CELLS) {
       cell.mass /= 2;
-      cell.radius = massToRadius(cell.mass);
-      cell.canMergeAfter = now + 15000;
+      cell.updateRadius();
+      cell.canMergeAfter = now + MERGE_TIME * 1000;
 
       let avgX = 0, avgY = 0;
       player.cells.forEach(c => { avgX += c.x; avgY += c.y; });
@@ -194,19 +257,10 @@ function splitPlayer(player) {
       const targetX = cell.x + Math.cos(angle) * (cell.radius + 5);
       const targetY = cell.y + Math.sin(angle) * (cell.radius + 5);
 
-      const splitCell = {
-        id: entityIdCounter++,
-        x: targetX,
-        y: targetY,
-        prevX: cell.x,
-        prevY: cell.y,
-        vx: Math.cos(angle) * splitImpulse,
-        vy: Math.sin(angle) * splitImpulse,
-        mass: cell.mass,
-        radius: cell.radius,
-        canMergeAfter: now + 15000,
-        spawnProtectedUntil: cell.spawnProtectedUntil // Inherit protection if active
-      };
+      const splitCell = new PlayerCellEntity(entityIdCounter++, targetX, targetY, cell.mass, player.color, cell.spawnProtectedUntil);
+      splitCell.vx = Math.cos(angle) * splitImpulse;
+      splitCell.vy = Math.sin(angle) * splitImpulse;
+      splitCell.canMergeAfter = now + MERGE_TIME * 1000;
       newCells.push(splitCell);
     }
   });
@@ -225,23 +279,19 @@ function ejectMass(player) {
   player.cells.forEach(cell => {
     if (cell.mass >= INITIAL_MASS + EJECT_MASS_COST) {
       cell.mass -= EJECT_MASS_COST;
-      cell.radius = massToRadius(cell.mass);
+      cell.updateRadius();
 
       const angle = Math.atan2(mouseWorldY - cell.y, mouseWorldX - cell.x);
       const spawnDist = cell.radius + 10;
 
-      entities.push({
-        id: entityIdCounter++,
-        type: 'ejected',
-        x: cell.x + Math.cos(angle) * spawnDist,
-        y: cell.y + Math.sin(angle) * spawnDist,
-        vx: Math.cos(angle) * 90,
-        vy: Math.sin(angle) * 90,
-        mass: EJECT_MASS_VALUE,
-        radius: massToRadius(EJECT_MASS_VALUE),
-        color: player.color,
-        isSpiky: false
-      });
+      entities.push(new EjectedEntity(
+        entityIdCounter++,
+        cell.x + Math.cos(angle) * spawnDist,
+        cell.y + Math.sin(angle) * spawnDist,
+        Math.cos(angle) * 90,
+        Math.sin(angle) * 90,
+        player.color
+      ));
     }
   });
 }
@@ -255,24 +305,16 @@ function explodeCellOnVirus(player, cell) {
 
   const newMass = cell.mass / (pieces + 1);
   cell.mass = newMass;
-  cell.radius = massToRadius(newMass);
-  cell.canMergeAfter = Date.now() + 20000;
+  cell.updateRadius();
+  cell.canMergeAfter = Date.now() + MERGE_TIME * 1000;
 
   for (let i = 0; i < pieces; i++) {
     const angle = (Math.PI * 2 / pieces) * i;
-    player.cells.push({
-      id: entityIdCounter++,
-      x: cell.x,
-      y: cell.y,
-      prevX: cell.x,
-      prevY: cell.y,
-      vx: Math.cos(angle) * 20,
-      vy: Math.sin(angle) * 20,
-      mass: newMass,
-      radius: massToRadius(newMass),
-      canMergeAfter: Date.now() + 20000,
-      spawnProtectedUntil: cell.spawnProtectedUntil
-    });
+    const splitCell = new PlayerCellEntity(entityIdCounter++, cell.x, cell.y, newMass, player.color, cell.spawnProtectedUntil);
+    splitCell.vx = Math.cos(angle) * 20;
+    splitCell.vy = Math.sin(angle) * 20;
+    splitCell.canMergeAfter = Date.now() + MERGE_TIME * 1000;
+    player.cells.push(splitCell);
   }
 }
 
@@ -280,6 +322,35 @@ function explodeCellOnVirus(player, cell) {
 setInterval(() => {
   const now = Date.now();
   frameCounter++;
+
+  // Virus Overlap & Soft Repulsion
+  const viruses = entities.filter(e => e.type === 'virus');
+  for (let i = 0; i < viruses.length; i++) {
+    for (let j = i + 1; j < viruses.length; j++) {
+      let v1 = viruses[i];
+      let v2 = viruses[j];
+      let dx = v2.x - v1.x;
+      let dy = v2.y - v1.y;
+      let dist = Math.hypot(dx, dy);
+      let minDist = v1.radius + v2.radius;
+
+      if (dist < minDist) {
+        let overlap = minDist - dist;
+        let angle = Math.atan2(dy, dx);
+        let push = overlap * 0.15;
+
+        v1.x -= Math.cos(angle) * push;
+        v1.y -= Math.sin(angle) * push;
+        v2.x += Math.cos(angle) * push;
+        v2.y += Math.sin(angle) * push;
+
+        v1.x = Math.max(v1.radius, Math.min(WORLD_SIZE - v1.radius, v1.x));
+        v1.y = Math.max(v1.radius, Math.min(WORLD_SIZE - v1.radius, v1.y));
+        v2.x = Math.max(v2.radius, Math.min(WORLD_SIZE - v2.radius, v2.x));
+        v2.y = Math.max(v2.radius, Math.min(WORLD_SIZE - v2.radius, v2.y));
+      }
+    }
+  }
 
   // Bots
   Object.values(players).forEach((p, index) => {
@@ -346,12 +417,9 @@ setInterval(() => {
   for (let i = entities.length - 1; i >= 0; i--) {
     const e = entities[i];
     if (e.type === 'ejected') {
-      e.x += e.vx;
-      e.y += e.vy;
-      e.vx *= 0.82;
-      e.vy *= 0.82;
+      e.updatePosition(WORLD_SIZE, 0.82);
 
-      if (e.x < 0 || e.x > WORLD_SIZE || e.y < 0 || e.y > WORLD_SIZE) {
+      if (e.x <= 0 || e.x >= WORLD_SIZE || e.y <= 0 || e.y >= WORLD_SIZE) {
         entities.splice(i, 1);
       }
     }
@@ -391,17 +459,11 @@ setInterval(() => {
         cell.vy += Math.sin(angle) * baseSpeed * 0.25;
       }
 
-      cell.x += cell.vx;
-      cell.y += cell.vy;
-      cell.vx *= 0.85;
-      cell.vy *= 0.85;
-
-      cell.x = Math.max(cell.radius, Math.min(WORLD_SIZE - cell.radius, cell.x));
-      cell.y = Math.max(cell.radius, Math.min(WORLD_SIZE - cell.radius, cell.y));
+      cell.updatePosition(WORLD_SIZE, 0.85);
 
       if (cell.mass > INITIAL_MASS * 2) {
         cell.mass -= cell.mass * 0.00008;
-        cell.radius = massToRadius(cell.mass);
+        cell.updateRadius();
       }
     });
 
@@ -419,7 +481,7 @@ setInterval(() => {
           if (now > c1.canMergeAfter && now > c2.canMergeAfter) {
             if (cellDist < c1.radius + c2.radius * 0.3) {
               c1.mass += c2.mass;
-              c1.radius = massToRadius(c1.mass);
+              c1.updateRadius();
               p.cells.splice(j, 1);
               j--;
             }
@@ -465,7 +527,7 @@ setInterval(() => {
 
           if (distSq <= maxEatDist * maxEatDist) {
             cell.mass += e.mass;
-            cell.radius = massToRadius(cell.mass);
+            cell.updateRadius();
             entities.splice(i, 1);
             spawnFood();
           }
@@ -473,13 +535,14 @@ setInterval(() => {
           const dist = Math.hypot(cell.x - e.x, cell.y - e.y);
           if (dist <= cell.radius + e.radius * 0.5 + 5) {
             cell.mass += e.mass;
-            cell.radius = massToRadius(cell.mass);
+            cell.updateRadius();
             entities.splice(i, 1);
           }
         } else if (e.type === 'virus') {
           const dist = Math.hypot(cell.x - e.x, cell.y - e.y);
           if (dist < cell.radius + e.radius) {
             if (cell.mass > e.mass * 1.15) {
+              cell.mass += e.mass;
               explodeCellOnVirus(p, cell);
               entities.splice(i, 1);
               spawnVirus();
@@ -490,7 +553,7 @@ setInterval(() => {
     });
   });
 
-  // Player vs Player Eating (Overlap Pass - Spawn Protected cells cannot be eaten)
+  // Player vs Player Eating
   const allPlayerCells = [];
   Object.values(players).forEach(p => {
     p.cells.forEach(cell => {
@@ -519,11 +582,11 @@ setInterval(() => {
 
       if (!c2Protected && c1.mass > c2.mass * 1.10 && dist < c1.radius) {
         c1.mass += c2.mass;
-        c1.radius = massToRadius(c1.mass);
+        c1.updateRadius();
         cellsToRemove.add(c2);
       } else if (!c1Protected && c2.mass > c1.mass * 1.10 && dist < c2.radius) {
         c2.mass += c1.mass;
-        c2.radius = massToRadius(c2.mass);
+        c2.updateRadius();
         cellsToRemove.add(c1);
         break;
       }
@@ -546,30 +609,62 @@ setInterval(() => {
     return { id: p.id, name: p.name || 'Unnamed', mass: Math.floor(totalMass) };
   }).sort((a, b) => b.mass - a.mass).slice(0, 10);
 
-  const snapshot = JSON.stringify({
-    type: 'state',
-    entities,
-    leaderboard,
-    players: Object.values(players).map(p => ({
-      id: p.id,
-      name: p.name,
-      color: p.color,
-      cells: p.cells.map(c => ({
-        id: c.id, 
-        x: c.x, 
-        y: c.y, 
-        vx: c.vx, 
-        vy: c.vy, 
-        mass: c.mass, 
-        radius: c.radius, 
-        canMergeAfter: c.canMergeAfter,
-        spawnProtectedUntil: c.spawnProtectedUntil
-      }))
-    }))
-  });
+  // ==========================================
+  // SPATIAL GRID NETWORK VIEWPORT OPTIMIZATION
+  // ==========================================
+  const CHUNK_SIZE = 800; 
+  const spatialGrid = new SpatialGrid(CHUNK_SIZE);
 
+  // 1. Populate the grid with environment entities (Food, Viruses, Ejected Mass)
+  for (let i = 0; i < entities.length; i++) {
+    spatialGrid.insertEntity(entities[i]);
+  }
+
+  // 2. Populate the grid with all player and bot cells
+  const allPlayers = Object.values(players);
+  for (let i = 0; i < allPlayers.length; i++) {
+    const p = allPlayers[i];
+    for (let j = 0; j < p.cells.length; j++) {
+      spatialGrid.insertPlayerCell(p, p.cells[j]);
+    }
+  }
+
+  // 3. Query the grid and broadcast custom payloads to connected clients
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(snapshot);
+    if (client.readyState === WebSocket.OPEN && client.playerId) {
+      const p = players[client.playerId];
+      if (!p) return;
+
+      let centerX = WORLD_SIZE / 2;
+      let centerY = WORLD_SIZE / 2;
+      let viewRadius = 1500; // Base viewport cutoff radius
+
+      if (p.cells.length > 0) {
+        let sumX = 0, sumY = 0, maxRadius = 0;
+        for (let i = 0; i < p.cells.length; i++) {
+          sumX += p.cells[i].x; 
+          sumY += p.cells[i].y;
+          if (p.cells[i].radius > maxRadius) maxRadius = p.cells[i].radius;
+        }
+        centerX = sumX / p.cells.length;
+        centerY = sumY / p.cells.length;
+        
+        // Scale the network chunk loading dynamically as the player gets larger and zooms out
+        viewRadius = Math.max(1500, maxRadius * 6);
+      }
+
+      // Query the spatial grid for objects exclusively within this client's viewport
+      const { entities: visibleEntities, players: visiblePlayers } = spatialGrid.query(centerX, centerY, viewRadius);
+
+      const localizedSnapshot = JSON.stringify({
+        type: 'state',
+        entities: visibleEntities,
+        leaderboard,
+        players: visiblePlayers
+      });
+
+      client.send(localizedSnapshot);
+    }
   });
 }, 1000 / 30);
 

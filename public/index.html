@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Agar.io Clone - Smooth Size & Optimized</title>
+  <title>Agar.io Clone - Smooth Size & Optimized with Skins & Jelly Physics</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
     body, html { width: 100%; height: 100%; overflow: hidden; background: #111; font-family: sans-serif; }
@@ -14,14 +14,14 @@
       background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 10;
     }
     .panel {
-      background: #222; padding: 30px; border-radius: 12px; text-align: center; color: white; width: 300px;
+      background: #222; padding: 30px; border-radius: 12px; text-align: center; color: white; width: 320px;
     }
     .panel input {
-      width: 100%; padding: 12px; margin: 15px 0; border: none; border-radius: 6px; font-size: 16px; text-align: center;
+      width: 100%; padding: 12px; margin: 10px 0; border: none; border-radius: 6px; font-size: 16px; text-align: center;
     }
     .panel button {
       width: 100%; padding: 12px; background: #3b82f6; border: none; color: white;
-      font-size: 18px; font-weight: bold; border-radius: 6px; cursor: pointer;
+      font-size: 18px; font-weight: bold; border-radius: 6px; cursor: pointer; margin-top: 10px;
     }
 
     .touch-btn {
@@ -39,6 +39,7 @@
     <div class="panel">
       <h2>Agar.io Clone</h2>
       <input type="text" id="nickname" placeholder="Enter Nickname" maxlength="12">
+      <input type="text" id="skin" placeholder="Skin Image URL (optional)" maxlength="255">
       <button id="start-btn">Play</button>
     </div>
   </div>
@@ -59,6 +60,7 @@
     
     const clientEntitiesMap = new Map();
     const clientPlayersMap = new Map();
+    const skinImageCache = new Map();
     let localCells = []; 
     let leaderboardData = [];
 
@@ -69,7 +71,7 @@
 
     let touchJoystick = null;
     let lastTargetSend = 0;
-    let currentMaxRadius = 40; // Tracked for smooth zoom scaling
+    let currentMaxRadius = 40;
 
     const getRadius = (mass) => Math.sqrt(mass) * 6;
 
@@ -89,8 +91,21 @@
     window.addEventListener('resize', resize);
     resize();
 
+    function getSkinImage(url) {
+      if (!url) return null;
+      if (skinImageCache.has(url)) {
+        return skinImageCache.get(url);
+      }
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = url;
+      skinImageCache.set(url, img);
+      return img;
+    }
+
     document.getElementById('start-btn').onclick = () => {
       const name = document.getElementById('nickname').value;
+      const skin = document.getElementById('skin').value;
       document.getElementById('overlay').style.display = 'none';
       isDead = false;
 
@@ -107,7 +122,7 @@
           if (msg.type === 'init') {
             myPlayerId = msg.playerId;
             worldSize = msg.worldSize;
-            ws.send(JSON.stringify({ type: 'join', name }));
+            ws.send(JSON.stringify({ type: 'join', name, skin }));
           } else if (msg.type === 'state') {
             leaderboardData = msg.leaderboard || [];
 
@@ -150,11 +165,12 @@
               const sPlayer = msg.players[i];
               let pObj = clientPlayersMap.get(sPlayer.id);
               if (!pObj) {
-                pObj = { id: sPlayer.id, name: sPlayer.name, color: sPlayer.color, cells: new Map() };
+                pObj = { id: sPlayer.id, name: sPlayer.name, color: sPlayer.color, skin: sPlayer.skin, cells: new Map() };
                 clientPlayersMap.set(sPlayer.id, pObj);
               }
               pObj.name = sPlayer.name;
               pObj.color = sPlayer.color;
+              pObj.skin = sPlayer.skin;
 
               const currentCellIds = new Set();
               for (let j = 0; j < sPlayer.cells.length; j++) {
@@ -168,7 +184,8 @@
                     targetY: sCell.y,
                     targetMass: sCell.mass,
                     radius: getRadius(sCell.mass),
-                    spawnProtectedUntil: sCell.spawnProtectedUntil
+                    spawnProtectedUntil: sCell.spawnProtectedUntil,
+                    isSpiky: sCell.isSpiky
                   });
                 } else {
                   cCell.targetX = sCell.x;
@@ -178,6 +195,7 @@
                   cCell.vy = sCell.vy;
                   cCell.canMergeAfter = sCell.canMergeAfter;
                   cCell.spawnProtectedUntil = sCell.spawnProtectedUntil;
+                  cCell.isSpiky = sCell.isSpiky;
                 }
               }
               for (let [cId] of pObj.cells) {
@@ -198,7 +216,8 @@
                     targetY: c.y, 
                     targetMass: c.mass, 
                     radius: getRadius(c.mass),
-                    spawnProtectedUntil: c.spawnProtectedUntil
+                    spawnProtectedUntil: c.spawnProtectedUntil,
+                    isSpiky: c.isSpiky
                   }));
                 } else {
                   for (let i = 0; i < me.cells.length; i++) {
@@ -212,6 +231,7 @@
                       lCell.vy = sCell.vy;
                       lCell.canMergeAfter = sCell.canMergeAfter;
                       lCell.spawnProtectedUntil = sCell.spawnProtectedUntil;
+                      lCell.isSpiky = sCell.isSpiky;
                     } else {
                       localCells.push({ 
                         ...sCell, 
@@ -219,7 +239,8 @@
                         targetY: sCell.y, 
                         targetMass: sCell.mass, 
                         radius: getRadius(sCell.mass),
-                        spawnProtectedUntil: sCell.spawnProtectedUntil
+                        spawnProtectedUntil: sCell.spawnProtectedUntil,
+                        isSpiky: sCell.isSpiky
                       });
                     }
                   }
@@ -232,7 +253,7 @@
           }
         };
       } else {
-        ws.send(JSON.stringify({ type: 'join', name }));
+        ws.send(JSON.stringify({ type: 'join', name, skin }));
       }
     };
 
@@ -319,7 +340,6 @@
       ctx.save();
       ctx.translate(entity.x, entity.y);
 
-      // Apply transparency if spawn-protected
       const isProtected = entity.spawnProtectedUntil && entity.spawnProtectedUntil > Date.now();
       if (isProtected) {
         ctx.globalAlpha = 0.4;
@@ -339,6 +359,23 @@
           else ctx.lineTo(x, y);
         }
         ctx.closePath();
+      } else if (window.ripple) {
+        // Jelly / Ripply organic blob deformation using sine waves over time
+        const points = 32;
+        const time = Date.now() * 0.004;
+        const phase = (entity.id || 1) * 1.5; // Unique phase offset per entity so they don't ripple in sync
+        for (let i = 0; i < points; i++) {
+          const angle = (i / points) * Math.PI * 2;
+          const wave1 = Math.sin(angle * 5 + time + phase);
+          const wave2 = Math.cos(angle * 3 - time * 0.7);
+          const wobble = (wave1 + wave2) * (entity.radius * 0.035);
+          const r = Math.max(4, entity.radius + wobble);
+          const x = Math.cos(angle) * r;
+          const y = Math.sin(angle) * r;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
       } else {
         ctx.arc(0, 0, entity.radius, 0, Math.PI * 2);
       }
@@ -346,8 +383,19 @@
       ctx.fillStyle = entity.color || '#fff';
       ctx.fill();
 
+      // Draw Skin Image if available and loaded successfully (automatically warps with jelly path)
+      if (entity.skin) {
+        const skinImg = getSkinImage(entity.skin);
+        if (skinImg && skinImg.complete && skinImg.naturalWidth !== 0) {
+          ctx.save();
+          ctx.clip();
+          ctx.drawImage(skinImg, -entity.radius * 1.2, -entity.radius * 1.2, entity.radius * 2.4, entity.radius * 2.4);
+          ctx.restore();
+        }
+      }
+
       ctx.strokeStyle = darkenColor(entity.color, 0.25);
-      ctx.lineWidth = Math.max(2, entity.radius * 0.06);
+      ctx.lineWidth = Math.max(2, 0.06);
       ctx.stroke();
 
       if (entity.name) {
@@ -463,24 +511,48 @@
       predictLocalPhysics(dt);
 
       if (!isDead && localCells.length > 0) {
-        let sumX = 0, sumY = 0, targetMaxRadius = 0;
+        let totalMass = 0;
+        let minX = Infinity, maxX = -Infinity;
+        let minY = Infinity, maxY = -Infinity;
+        let sumX = 0, sumY = 0;
+
+        // 1. Calculate center and find the outer physical boundaries of all cells
         for (let i = 0; i < localCells.length; i++) {
-          sumX += localCells[i].x;
-          sumY += localCells[i].y;
-          if (localCells[i].radius > targetMaxRadius) targetMaxRadius = localCells[i].radius;
+          const cell = localCells[i];
+          totalMass += cell.mass;
+          sumX += cell.x;
+          sumY += cell.y;
+
+          if (cell.x - cell.radius < minX) minX = cell.x - cell.radius;
+          if (cell.x + cell.radius > maxX) maxX = cell.x + cell.radius;
+          if (cell.y - cell.radius < minY) minY = cell.y - cell.radius;
+          if (cell.y + cell.radius > maxY) maxY = cell.y + cell.radius;
         }
+
+        // 2. Camera targets the average position for a smooth follow
         camera.targetX = sumX / localCells.length;
         camera.targetY = sumY / localCells.length;
 
-        currentMaxRadius += (targetMaxRadius - currentMaxRadius) * Math.min(1, 0.1 * dt);
+        // 3. The absolute minimum scale is the equivalent size of all mass combined
+        // This prevents the camera from zooming IN during the split animation
+        const baseRadius = Math.sqrt(totalMass) * 6;
 
+        // 4. Calculate the true physical radius based on the bounding box spread
+        const spreadX = (maxX - minX) / 2;
+        const spreadY = (maxY - minY) / 2;
+        const actualSpreadRadius = Math.max(spreadX, spreadY);
+
+        // 5. Use whichever is larger: physical spread or combined mass
+        const targetRadius = Math.max(baseRadius, actualSpreadRadius);
+
+        // 6. Smooth the camera's interpolation
+        currentMaxRadius += (targetRadius - currentMaxRadius) * Math.min(1, 0.1 * dt);
+
+        // 7. Calculate final scale with Agar.io style FOV padding (3.5x multiplier)
         const screenMin = Math.min(canvas.width, canvas.height);
-        const targetViewSize = Math.max(720, currentMaxRadius * 4.6 + 200);
-        camera.targetScale = Math.min(1.25, Math.max(0.06, screenMin / targetViewSize));
-      } else {
-        camera.targetX = worldSize / 2;
-        camera.targetY = worldSize / 2;
-        camera.targetScale = 1.0;
+        const targetViewSize = Math.max(800, currentMaxRadius * 3.5 + 200);
+        
+        camera.targetScale = Math.min(1.2, screenMin / targetViewSize);
       }
 
       const camLerp = Math.min(1, 0.08 * dt);
@@ -521,7 +593,7 @@
       clientPlayersMap.forEach((player, pId) => {
         if (pId === myPlayerId) return;
         player.cells.forEach(cell => {
-          renderList.push({ ...cell, color: player.color, name: player.name, isSpiky: false });
+          renderList.push({ ...cell, color: player.color, name: player.name, skin: player.skin });
         });
       });
 
@@ -529,9 +601,10 @@
         const myPlayer = clientPlayersMap.get(myPlayerId);
         const color = myPlayer ? myPlayer.color : '#fff';
         const name = myPlayer ? myPlayer.name : '';
+        const skin = myPlayer ? myPlayer.skin : '';
 
         for (let i = 0; i < localCells.length; i++) {
-          renderList.push({ ...localCells[i], color, name, isSpiky: false });
+          renderList.push({ ...localCells[i], color, name, skin });
         }
       }
 
