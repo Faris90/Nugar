@@ -32,7 +32,7 @@ const FOOD_MASS = config.FOOD_MASS ?? 5;
 const MAX_PLAYER_CELLS = config.MAX_PLAYER_CELLS ?? 16;
 const FOOD_COUNT = config.FOOD_COUNT ?? 1000;
 const VIRUS_COUNT = config.VIRUS_COUNT ?? 30;
-const BOT_COUNT = config.BOT_COUNT ?? 10;
+const BOT_COUNT = config.BOT_COUNT ?? 50;
 const SPAWN_PROTECTION_DURATION = config.SPAWN_PROTECTION_DURATION ?? 5000;
 const MERGE_TIME = config.MERGE_TIME ?? 15;
 const COLORS = ['#ff4d4d', '#33ca7f', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899'];
@@ -42,6 +42,32 @@ const FoodEntity = require('./entity/Food');
 const VirusEntity = require('./entity/Virus');
 const EjectedEntity = require('./entity/EjectedMass');
 const PlayerCellEntity = require('./entity/PlayerCell');
+
+const TEAM_MODE = config.TEAM_MODE ?? 0; // 1 for teams enabled, 0 for FFA
+const TEAMS = [
+  { id: 'red', name: 'Red', color: '#ff4d4d' },
+  { id: 'blue', name: 'Blue', color: '#3b82f6' },
+  { id: 'green', name: 'Green', color: '#33ca7f' },
+  { id: 'purple', name: 'Purple', color: '#8b5cf6' }
+];
+
+function getBalancedTeam() {
+  const counts = {};
+  TEAMS.forEach(t => counts[t.id] = 0);
+  Object.values(players).forEach(p => {
+    if (p.team && counts[p.team] !== undefined) counts[p.team]++;
+  });
+  let selected = TEAMS[0];
+  let min = Infinity;
+  TEAMS.forEach(t => {
+    if (counts[t.id] < min) {
+      min = counts[t.id];
+      selected = t;
+    }
+  });
+  return selected;
+}
+
 class SpatialGrid {
   constructor(cellSize) {
     this.cellSize = cellSize;
@@ -128,7 +154,7 @@ function initWorld() {
 
 function spawnFood() {
   const color = COLORS[Math.floor(Math.random() * COLORS.length)];
-  entities.push(new FoodEntity(entityIdCounter++, Math.random() * WORLD_SIZE, Math.random() * WORLD_SIZE, color));
+  entities.push(new FoodEntity(entityIdCounter++, Math.random() * WORLD_SIZE, Math.random() * WORLD_SIZE, color, FOOD_MASS));
 }
 
 function spawnVirus() {
@@ -142,12 +168,14 @@ function spawnBot() {
   const now = Date.now();
   const spawnX = Math.random() * (WORLD_SIZE - 1000) + 500;
   const spawnY = Math.random() * (WORLD_SIZE - 1000) + 500;
-  const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+  const team = TEAM_MODE ? getBalancedTeam() : null;
+  const color = team ? team.color : COLORS[Math.floor(Math.random() * COLORS.length)];
 
   players[botId] = {
     id: botId,
     name: 'Bot_' + Math.floor(Math.random() * 900 + 100),
     color: color,
+    team: team ? team.id : null,
     skin: null,
     isBot: true,
     wanderTarget: null,
@@ -162,12 +190,14 @@ wss.on('connection', (ws) => {
   const now = Date.now();
   const spawnX = Math.random() * (WORLD_SIZE - 1000) + 500;
   const spawnY = Math.random() * (WORLD_SIZE - 1000) + 500;
-  const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+  const team = TEAM_MODE ? getBalancedTeam() : null;
+  const color = team ? team.color : COLORS[Math.floor(Math.random() * COLORS.length)];
   
   players[playerId] = {
     id: playerId,
     name: 'Cell',
     color: color,
+    team: team ? team.id : null,
     skin: null,
     isBot: false,
     cells: [new PlayerCellEntity(entityIdCounter++, spawnX, spawnY, INITIAL_MASS, color, now + SPAWN_PROTECTION_DURATION)],
@@ -186,38 +216,20 @@ wss.on('connection', (ws) => {
         p.name = data.name.trim().slice(0, 12) || 'Unnamed';
         p.skin = data.skin ? data.skin.trim().slice(0, 255) : null;
         
-        if (p.cells.length > 0) {
-        let totalMass = 0;
-        let minX = Infinity, maxX = -Infinity;
-        let minY = Infinity, maxY = -Infinity;
-        let sumX = 0, sumY = 0;
-
-        for (let i = 0; i < p.cells.length; i++) {
-          const cell = p.cells[i];
-          totalMass += cell.mass;
-          sumX += cell.x; 
-          sumY += cell.y;
-          
-          // Calculate the outer physical boundaries of all cells
-          if (cell.x - cell.radius < minX) minX = cell.x - cell.radius;
-          if (cell.x + cell.radius > maxX) maxX = cell.x + cell.radius;
-          if (cell.y - cell.radius < minY) minY = cell.y - cell.radius;
-          if (cell.y + cell.radius > maxY) maxY = cell.y + cell.radius;
-        }
+        p.cells = [];
         
-        centerX = sumX / p.cells.length;
-        centerY = sumY / p.cells.length;
+        const rx = Math.random() * (WORLD_SIZE - 1000) + 500;
+        const ry = Math.random() * (WORLD_SIZE - 1000) + 500;
+        const respawnNow = Date.now();
         
-        const baseRadius = Math.sqrt(totalMass) * 6;
-        const spreadX = (maxX - minX) / 2;
-        const spreadY = (maxY - minY) / 2;
-        const actualSpreadRadius = Math.max(spreadX, spreadY);
-        
-        const targetRadius = Math.max(baseRadius, actualSpreadRadius);
-
-        // Match the client's 3.5x FOV padding + a little extra for network buffer
-        viewRadius = Math.max(1500, targetRadius * 4.5);
-      }
+        p.cells.push(new PlayerCellEntity(
+          entityIdCounter++, 
+          rx, 
+          ry, 
+          INITIAL_MASS, 
+          p.color, 
+          respawnNow + SPAWN_PROTECTION_DURATION
+        ));
       } else if (data.type === 'target') {
         p.input.offsetX = data.offsetX;
         p.input.offsetY = data.offsetY;
@@ -269,27 +281,27 @@ function splitPlayer(player) {
 }
 
 function ejectMass(player) {
-  let avgX = 0, avgY = 0;
-  player.cells.forEach(c => { avgX += c.x; avgY += c.y; });
-  avgX /= player.cells.length;
-  avgY /= player.cells.length;
-  const mouseWorldX = avgX + (player.input.offsetX || 0);
-  const mouseWorldY = avgY + (player.input.offsetY || 0);
+  const offsetX = player.input.offsetX || 0;
+  const offsetY = player.input.offsetY || 0;
 
-  player.cells.forEach(cell => {
+  if (offsetX === 0 && offsetY === 0) return;
+
+  // Use the uniform mouse direction vector so all cells eject parallel to the cursor
+  const angle = Math.atan2(offsetY, offsetX);
+  const dispersedAngle = angle + (Math.random() * .4) - .2;
+  player.cells.init = player.cells.forEach(cell => {
     if (cell.mass >= INITIAL_MASS + EJECT_MASS_COST) {
       cell.mass -= EJECT_MASS_COST;
       cell.updateRadius();
 
-      const angle = Math.atan2(mouseWorldY - cell.y, mouseWorldX - cell.x);
       const spawnDist = cell.radius + 10;
 
       entities.push(new EjectedEntity(
         entityIdCounter++,
         cell.x + Math.cos(angle) * spawnDist,
         cell.y + Math.sin(angle) * spawnDist,
-        Math.cos(angle) * 90,
-        Math.sin(angle) * 90,
+        Math.cos(dispersedAngle) * 90,
+        Math.sin(dispersedAngle) * 90,
         player.color
       ));
     }
@@ -323,6 +335,29 @@ setInterval(() => {
   const now = Date.now();
   frameCounter++;
 
+  // Build Spatial Grid early for high-performance localized queries & collision checks
+  const CHUNK_SIZE = 800;
+  const spatialGrid = new SpatialGrid(CHUNK_SIZE);
+
+  for (let i = 0; i < entities.length; i++) {
+    spatialGrid.insertEntity(entities[i]);
+  }
+  const allPlayersArr = Object.values(players);
+  for (let i = 0; i < allPlayersArr.length; i++) {
+    const p = allPlayersArr[i];
+    for (let j = 0; j < p.cells.length; j++) {
+      spatialGrid.insertPlayerCell(p, p.cells[j]);
+    }
+  }
+
+  // Virus Movement & Position Updates (Global & immediate to fix pushing delay)
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.type === 'virus') {
+      e.updatePosition(WORLD_SIZE, 0.85);
+    }
+  }
+
   // Virus Overlap & Soft Repulsion
   const viruses = entities.filter(e => e.type === 'virus');
   for (let i = 0; i < viruses.length; i++) {
@@ -352,17 +387,20 @@ setInterval(() => {
     }
   }
 
-  // Bots
-  Object.values(players).forEach((p, index) => {
+  // Bots (Staggered updates over 10 frames to spread CPU load for 50+ bots)
+  allPlayersArr.forEach((p, index) => {
     if (p.isBot && p.cells.length > 0) {
-      if (index % 5 !== frameCounter % 5) return;
+      if (index % 10 !== frameCounter % 10) return;
 
       const cell = p.cells[0];
+      
+      const localQuery = spatialGrid.query(cell.x, cell.y, 600);
+      
       let nearestFood = null;
       let minDistFood = Infinity;
 
-      for (let i = 0; i < entities.length; i++) {
-        const e = entities[i];
+      for (let i = 0; i < localQuery.entities.length; i++) {
+        const e = localQuery.entities[i];
         if (e.type === 'food') {
           const dist = Math.hypot(e.x - cell.x, e.y - cell.y);
           if (dist < minDistFood) {
@@ -374,7 +412,7 @@ setInterval(() => {
 
       let nearestThreat = null;
       let minDistThreat = Infinity;
-      Object.values(players).forEach(otherP => {
+      localQuery.players.forEach(otherP => {
         if (otherP.id === p.id) return;
         otherP.cells.forEach(oCell => {
           if (oCell.mass > cell.mass * 1.1) {
@@ -413,7 +451,7 @@ setInterval(() => {
     }
   });
 
-  // Ejected Mass Movement
+  // Ejected Mass Movement & Virus Collision
   for (let i = entities.length - 1; i >= 0; i--) {
     const e = entities[i];
     if (e.type === 'ejected') {
@@ -421,12 +459,44 @@ setInterval(() => {
 
       if (e.x <= 0 || e.x >= WORLD_SIZE || e.y <= 0 || e.y >= WORLD_SIZE) {
         entities.splice(i, 1);
+        continue;
+      }
+
+      // Check collision with viruses using correct radius summation
+      for (let j = entities.length - 1; j >= 0; j--) {
+        const v = entities[j];
+        if (v.type === 'virus') {
+          const dist = Math.hypot(e.x - v.x, e.y - v.y);
+          if (dist < v.radius + e.radius) {
+            const angle = Math.atan2(e.vy, e.vx) || Math.atan2(v.y - e.y, v.x - e.x);
+            const pushForce = 12;
+            v.vx += Math.cos(angle) * pushForce;
+            v.vy += Math.sin(angle) * pushForce;
+            v.feedCount = (v.feedCount || 0) + 1;
+
+            if (v.feedCount >= 7) {
+              v.feedCount = 0;
+              const shotSpeed = 60;
+              const newVirus = new VirusEntity(
+                entityIdCounter++,
+                v.x + Math.cos(angle) * (v.radius + 20),
+                v.y + Math.sin(angle) * (v.radius + 20)
+              );
+              newVirus.vx = Math.cos(angle) * shotSpeed;
+              newVirus.vy = Math.sin(angle) * shotSpeed;
+              entities.push(newVirus);
+            }
+
+            entities.splice(i, 1);
+            break;
+          }
+        }
       }
     }
   }
 
-  // Player & Cell Movement (Per-Cell Mouse Targeting)
-  Object.values(players).forEach(p => {
+  // Player & Cell Movement
+  allPlayersArr.forEach(p => {
     const offsetX = p.input.offsetX || 0;
     const offsetY = p.input.offsetY || 0;
 
@@ -515,36 +585,40 @@ setInterval(() => {
     }
   });
 
-  // Food, Ejected Mass, and Virus Collisions for all player cells
-  Object.values(players).forEach(p => {
+  // Food, Ejected Mass, and Virus Collisions using Spatial Queries
+  allPlayersArr.forEach(p => {
     p.cells.forEach(cell => {
-      for (let i = entities.length - 1; i >= 0; i--) {
-        const e = entities[i];
+      const localQuery = spatialGrid.query(cell.x, cell.y, cell.radius + 100);
+
+      for (let i = 0; i < localQuery.entities.length; i++) {
+        const e = localQuery.entities[i];
+        const entityIndex = entities.indexOf(e);
+        if (entityIndex === -1) continue;
 
         if (e.type === 'food') {
           const maxEatDist = cell.radius + e.radius + 8;
           const distSq = distToSegmentSquared(e.x, e.y, cell.prevX, cell.prevY, cell.x, cell.y);
 
           if (distSq <= maxEatDist * maxEatDist) {
-            cell.mass += e.mass;
+            cell.addMass(e.mass);
             cell.updateRadius();
-            entities.splice(i, 1);
+            entities.splice(entityIndex, 1);
             spawnFood();
           }
         } else if (e.type === 'ejected') {
           const dist = Math.hypot(cell.x - e.x, cell.y - e.y);
           if (dist <= cell.radius + e.radius * 0.5 + 5) {
-            cell.mass += e.mass;
+            cell.addMass(e.mass);
             cell.updateRadius();
-            entities.splice(i, 1);
+            entities.splice(entityIndex, 1);
           }
         } else if (e.type === 'virus') {
           const dist = Math.hypot(cell.x - e.x, cell.y - e.y);
           if (dist < cell.radius + e.radius) {
             if (cell.mass > e.mass * 1.15) {
-              cell.mass += e.mass;
+              cell.addMass(e.mass);
               explodeCellOnVirus(p, cell);
-              entities.splice(i, 1);
+              entities.splice(entityIndex, 1);
               spawnVirus();
             }
           }
@@ -555,7 +629,7 @@ setInterval(() => {
 
   // Player vs Player Eating
   const allPlayerCells = [];
-  Object.values(players).forEach(p => {
+  allPlayersArr.forEach(p => {
     p.cells.forEach(cell => {
       allPlayerCells.push({ player: p, cell: cell });
     });
@@ -574,8 +648,22 @@ setInterval(() => {
 
       const c1 = item1.cell;
       const c2 = item2.cell;
-
       const dist = Math.hypot(c2.x - c1.x, c2.y - c1.y);
+
+      // Prevent teammates from eating each other; apply soft push instead
+      if (TEAM_MODE && item1.player.team === item2.player.team) {
+        const minDist = c1.radius + c2.radius;
+        if (dist < minDist) {
+          const overlap = minDist - dist;
+          const nx = (c2.x - c1.x) / (dist || 1);
+          const ny = (c2.y - c1.y) / (dist || 1);
+          c1.x -= nx * overlap * 0.5;
+          c1.y -= ny * overlap * 0.5;
+          c2.x += nx * overlap * 0.5;
+          c2.y += ny * overlap * 0.5;
+        }
+        continue;
+      }
 
       const c1Protected = now < c1.spawnProtectedUntil;
       const c2Protected = now < c2.spawnProtectedUntil;
@@ -594,42 +682,49 @@ setInterval(() => {
   }
 
   if (cellsToRemove.size > 0) {
-    Object.values(players).forEach(p => {
+    allPlayersArr.forEach(p => {
       p.cells = p.cells.filter(cell => !cellsToRemove.has(cell));
     });
   }
+
+  // Garbage Collection & Bot Respawning
+  Object.keys(players).forEach(id => {
+    const p = players[id];
+    if (p.isBot && p.cells.length === 0) {
+      delete players[id];
+    }
+  });
 
   const activeBots = Object.values(players).filter(p => p.isBot).length;
   for (let i = activeBots; i < BOT_COUNT; i++) {
     spawnBot();
   }
 
-  const leaderboard = Object.values(players).map(p => {
-    const totalMass = p.cells.reduce((sum, c) => sum + c.mass, 0);
-    return { id: p.id, name: p.name || 'Unnamed', mass: Math.floor(totalMass) };
-  }).sort((a, b) => b.mass - a.mass).slice(0, 10);
-
-  // ==========================================
-  // SPATIAL GRID NETWORK VIEWPORT OPTIMIZATION
-  // ==========================================
-  const CHUNK_SIZE = 800; 
-  const spatialGrid = new SpatialGrid(CHUNK_SIZE);
-
-  // 1. Populate the grid with environment entities (Food, Viruses, Ejected Mass)
-  for (let i = 0; i < entities.length; i++) {
-    spatialGrid.insertEntity(entities[i]);
+  let leaderboard;
+  if (TEAM_MODE) {
+    const teamMasses = {};
+    TEAMS.forEach(t => teamMasses[t.id] = { name: t.name, color: t.color, mass: 0 });
+    Object.values(players).forEach(p => {
+      if (p.team && teamMasses[p.team]) {
+        const totalMass = p.cells.reduce((sum, c) => sum + c.mass, 0);
+        teamMasses[p.team].mass += totalMass;
+      }
+    });
+    const totalWorldMass = Object.values(teamMasses).reduce((sum, t) => sum + t.mass, 0) || 1;
+    leaderboard = Object.values(teamMasses).map(t => ({
+      name: t.name,
+      color: t.color,
+      mass: Math.floor(t.mass),
+      percentage: Number(((t.mass / totalWorldMass) * 100).toFixed(1))
+    }));
+  } else {
+    leaderboard = Object.values(players).map(p => {
+      const totalMass = p.cells.reduce((sum, c) => sum + c.mass, 0);
+      return { id: p.id, name: p.name || 'Unnamed', mass: Math.floor(totalMass) };
+    }).sort((a, b) => b.mass - a.mass).slice(0, 10);
   }
 
-  // 2. Populate the grid with all player and bot cells
-  const allPlayers = Object.values(players);
-  for (let i = 0; i < allPlayers.length; i++) {
-    const p = allPlayers[i];
-    for (let j = 0; j < p.cells.length; j++) {
-      spatialGrid.insertPlayerCell(p, p.cells[j]);
-    }
-  }
-
-  // 3. Query the grid and broadcast custom payloads to connected clients
+  // Network Viewport Synchronization
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && client.playerId) {
       const p = players[client.playerId];
@@ -637,7 +732,7 @@ setInterval(() => {
 
       let centerX = WORLD_SIZE / 2;
       let centerY = WORLD_SIZE / 2;
-      let viewRadius = 1500; // Base viewport cutoff radius
+      let viewRadius = 1500;
 
       if (p.cells.length > 0) {
         let sumX = 0, sumY = 0, maxRadius = 0;
@@ -648,12 +743,9 @@ setInterval(() => {
         }
         centerX = sumX / p.cells.length;
         centerY = sumY / p.cells.length;
-        
-        // Scale the network chunk loading dynamically as the player gets larger and zooms out
         viewRadius = Math.max(1500, maxRadius * 6);
       }
 
-      // Query the spatial grid for objects exclusively within this client's viewport
       const { entities: visibleEntities, players: visiblePlayers } = spatialGrid.query(centerX, centerY, viewRadius);
 
       const localizedSnapshot = JSON.stringify({

@@ -29,6 +29,10 @@ class CoreEntity {
     this.x = Math.max(this.radius, Math.min(worldSize - this.radius, this.x));
     this.y = Math.max(this.radius, Math.min(worldSize - this.radius, this.y));
   }
+
+  addMass(n) {
+    this.mass = Math.min(this.mass + n,22500);
+  }
 }
 
 module.exports = CoreEntity;
